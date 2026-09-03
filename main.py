@@ -27,12 +27,18 @@ async def proxy_request(url: str, request: Request):
             req_headers[k] = v
 
     # Add browser spoofing if missing
-    if "user-agent" not in req_headers:
+    headers_lower = [k.lower() for k in req_headers.keys()]
+    if "user-agent" not in headers_lower:
         req_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-    # FIX: Increased timeout to 60 seconds to prevent httpx.ReadTimeout crashes
+    # FIX: Don't stream the body for GET/HEAD requests to prevent StreamConsumed crash on redirects
+    if request.method in ["GET", "HEAD"]:
+        req_content = None
+    else:
+        req_content = await request.body() # Read into memory so redirects can reuse the body
+
     client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
-    req = client.build_request(request.method, target_url, headers=req_headers, content=request.stream())
+    req = client.build_request(request.method, target_url, headers=req_headers, content=req_content)
     
     try:
         # Stream the response back to handle large video files and fast HTML delivery
