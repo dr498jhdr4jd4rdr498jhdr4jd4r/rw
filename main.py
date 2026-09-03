@@ -46,7 +46,7 @@ def get_clean_headers(request: Request):
     return req_headers
 
 # ============================================================================
-# JSON Scraper Endpoints (Fully Safe & Crash-Proof)
+# JSON Scraper Endpoints
 # ============================================================================
 
 @app.get("/api/explore")
@@ -62,7 +62,7 @@ async def explore(q: str = "brazzers", page: int = 1):
             return JSONResponse([])
 
         videos = []
-        blocks = re.split(r'data-video-vkey="', html, flags=r're.IGNORECASE' if False else re.I)
+        blocks = re.split(r'data-video-vkey="', html, flags=re.I)
         
         for block in blocks[1:]:
             try:
@@ -106,11 +106,21 @@ async def explore(q: str = "brazzers", page: int = 1):
 @app.get("/api/extract")
 async def extract(url: str):
     try:
-        vkey_match = re.search(r'viewkey=([a-z0-9]+)', url)
+        if not url:
+            return JSONResponse({"status": "error", "error": "URL parameter is missing"})
+
+        # Safely extract viewkey from multiple possible URL variations
+        vkey_match = re.search(r'viewkey=([a-z0-9]+)', url, re.I)
         if not vkey_match:
-            return JSONResponse({"status": "error", "error": "Invalid viewkey in URL"})
-        
-        vkey = vkey_match.group(1)
+            # Fallback for embed or short links matching alphanumeric keys
+            alt_match = re.search(r'embed/([a-z0-9]+)', url, re.I)
+            if alt_match:
+                vkey = alt_match.group(1)
+            else:
+                return JSONResponse({"status": "error", "error": "Invalid or unsupported Pornhub link format."})
+        else:
+            vkey = vkey_match.group(1)
+
         target_url = f"https://www.pornhub.com/view_video.php?viewkey={vkey}"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"}
 
@@ -152,7 +162,12 @@ async def extract(url: str):
             if not v_url: continue
             
             fmt = m.get("format", "")
-            qual = str(m.get("quality", ["Auto"])[0] if isinstance(m.get("quality"), list) else m.get("quality", "Auto"))
+            qual = "Auto"
+            q_raw = m.get("quality")
+            if isinstance(q_raw, list) and len(q_raw) > 0:
+                qual = str(q_raw[0])
+            elif q_raw:
+                qual = str(q_raw)
             if not qual or qual == "[]": qual = "Auto"
             
             if fmt == "mp4" or "mp4" in v_url:
@@ -169,7 +184,11 @@ async def extract(url: str):
                             line = line.strip()
                             if line.startswith("#EXT-X-STREAM-INF:"):
                                 res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
-                                height = res_match.group(1).split('x')[1] if res_match and 'x' in res_match.group(1) else '0'
+                                height = "0"
+                                if res_match and res_match.group(1) and 'x' in res_match.group(1):
+                                    parts = res_match.group(1).split('x')
+                                    if len(parts) > 1:
+                                        height = parts[1]
                                 lbl = f"{height}p" if height.isdigit() and int(height)>0 else "Auto"
                                 if i+1 < len(lines) and not lines[i+1].startswith("#"):
                                     uri = lines[i+1].strip()
