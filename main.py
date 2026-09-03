@@ -82,19 +82,14 @@ async def explore(q: str = "brazzers", page: int = 1):
                     dur = "HD"
                     if dur_match:
                         raw_dur = dur_match.group(1) or dur_match.group(2)
-                        if raw_dur:
-                            dur = raw_dur.strip()
+                        if raw_dur: dur = raw_dur.strip()
                     
                     is_ad = re.search(r'\b(sponsor|promo|banner|signup|premium ads)\b', title, re.I)
                     
                     if not is_ad and not any(v['vkey'] == vkey for v in videos):
                         videos.append({
-                            "vkey": vkey,
-                            "title": title,
-                            "thumbnail": thumb,
-                            "duration": dur,
-                            "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
-                            "provider": "pornhub"
+                            "vkey": vkey, "title": title, "thumbnail": thumb, "duration": dur,
+                            "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}", "provider": "pornhub"
                         })
                 if len(videos) >= 48: break
             except Exception:
@@ -121,7 +116,7 @@ async def extract(url: str):
             vkey = vkey_match.group(1)
 
         target_url = f"https://www.pornhub.com/view_video.php?viewkey={vkey}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;", "Referer": "https://www.pornhub.com/"}
 
         try:
             r = await http_client.get(target_url, headers=headers)
@@ -150,6 +145,7 @@ async def extract(url: str):
 
         qualities = []
         direct_mp4 = {}
+
         for m in media_defs:
             if not isinstance(m, dict): continue
             v_url = m.get("videoUrl") or m.get("url")
@@ -200,12 +196,8 @@ async def extract(url: str):
             if og: title = og.group(1).replace(" - Pornhub.com", "")
 
         return JSONResponse({
-            "status": "success",
-            "title": title.strip(),
-            "thumbnail": poster,
-            "streams": {"qualities": qualities, "direct_mp4": direct_mp4},
-            "url": target_url,
-            "provider": "pornhub"
+            "status": "success", "title": title.strip(), "thumbnail": poster,
+            "streams": {"qualities": qualities, "direct_mp4": direct_mp4}, "url": target_url, "provider": "pornhub"
         })
     except Exception as e:
         return JSONResponse({"status": "error", "error": f"Internal API Error: {str(e)}"})
@@ -246,7 +238,8 @@ async def proxy_m3u8(url: str, request: Request):
         return Response(status_code=r.status_code)
         
     base = target[:target.rfind('/')+1]
-    cf_host = f"{request.url.scheme}://{request.headers.get('host')}"
+    request_host = request.query_params.get("request_host")
+    cf_host = f"https://{request_host}" if request_host else f"{request.url.scheme}://{request.headers.get('host')}"
     
     rewritten = []
     for line in r.text.splitlines():
@@ -264,7 +257,7 @@ async def proxy_m3u8(url: str, request: Request):
         else:
             abs_uri = line if line.startswith('http') else urljoin(base, line)
             if ".m3u8" in abs_uri:
-                rewritten.append(f"{cf_host}/proxy-m3u8?url={quote(abs_uri)}")
+                rewritten.append(f"{cf_host}/proxy-m3u8?url={quote(abs_uri)}&request_host={quote(request_host or '')}")
             else:
                 rewritten.append(f"{cf_host}/proxy-video?url={quote(abs_uri)}")
 
