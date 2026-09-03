@@ -133,7 +133,8 @@ async def extract(url: str):
         poster = ""
         media_defs = []
         
-        fv_match = re.search(r'flashvars(?:_\d+)?\s*=\s*(\{.*?\});', html, re.DOTALL)
+        # Comprehensive pattern matching for variable payloads
+        fv_match = re.search(r'flashvars_\d+\s*=\s*(\{.*?\});', html, re.DOTALL) or re.search(r'flashvars\s*=\s*(\{.*?\});', html, re.DOTALL) or re.search(r'var\s+playerObjList\s*=\s*(\{.*?\});', html, re.DOTALL)
         if fv_match:
             try:
                 data = json.loads(fv_match.group(1))
@@ -185,6 +186,10 @@ async def extract(url: str):
             for link in m3u8_links:
                 if not any(q['url'] == link for q in qualities):
                     qualities.append({"quality": "Auto", "url": link})
+
+        if not title or title == "Unknown Title":
+            og = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, re.I)
+            if og: title = og.group(1).replace(" - Pornhub.com", "")
 
         return JSONResponse({
             "status": "success",
