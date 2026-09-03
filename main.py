@@ -31,11 +31,11 @@ async def proxy_request(url: str, request: Request):
     if "user-agent" not in headers_lower:
         req_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-    # FIX: Don't stream the body for GET/HEAD requests to prevent StreamConsumed crash on redirects
-    if request.method in ["GET", "HEAD"]:
-        req_content = None
-    else:
-        req_content = await request.body() # Read into memory so redirects can reuse the body
+    # CRITICAL FIX: Do not pass streams for GET requests! Read POST bodies into memory.
+    # This prevents the httpx.StreamConsumed crash when the upstream CDN triggers a redirect.
+    req_content = None
+    if request.method not in ["GET", "HEAD", "OPTIONS"]:
+        req_content = await request.body() 
 
     client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
     req = client.build_request(request.method, target_url, headers=req_headers, content=req_content)
