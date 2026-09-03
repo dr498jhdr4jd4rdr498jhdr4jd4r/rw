@@ -143,7 +143,7 @@ async def extract(url: str):
                 try: media_defs = json.loads(md_match.group(1))
                 except: pass
 
-        streams = {"qualities": []}
+        qualities = []
         
         for m in media_defs:
             if not isinstance(m, dict): continue
@@ -170,23 +170,25 @@ async def extract(url: str):
                                 if i+1 < len(lines) and not lines[i+1].startswith("#"):
                                     uri = lines[i+1].strip()
                                     abs_uri = uri if uri.startswith("http") else urljoin(base_url, uri)
-                                    if not any(q['url'] == abs_uri for q in streams["qualities"]):
-                                        streams["qualities"].append({"quality": lbl, "url": abs_uri})
+                                    if not any(q['url'] == abs_uri for q in qualities):
+                                        qualities.append({"quality": lbl, "url": abs_uri})
                 except:
-                    if not any(q['url'] == v_url for q in streams["qualities"]):
-                        streams["qualities"].append({"quality": "Auto", "url": v_url})
+                    if not any(q['url'] == v_url for q in qualities):
+                        qualities.append({"quality": "Auto", "url": v_url})
 
-        if not streams["qualities"]:
+        if not qualities:
             m3u8_links = re.findall(r'https?:\/\/[^"\']+\.m3u8(?:\?[^"\']*)?', html)
             for link in m3u8_links:
-                if not any(q['url'] == link for q in streams["qualities"]):
-                    streams["qualities"].append({"quality": "Auto", "url": link})
+                if not any(q['url'] == link for q in qualities):
+                    qualities.append({"quality": "Auto", "url": link})
 
         return JSONResponse({
             "status": "success",
             "title": title.strip(),
             "thumbnail": poster,
-            "streams": streams,
+            "streams": {
+                "qualities": qualities
+            },
             "url": target_url,
             "provider": "pornhub"
         })
