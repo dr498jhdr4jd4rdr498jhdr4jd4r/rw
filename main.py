@@ -165,7 +165,6 @@ async def extract(url: str):
             if not qual or qual == "[]": qual = "Auto"
             
             if fmt == "mp4" or "mp4" in v_url:
-                # FIXED: Changed to Python's built-in .upper() method
                 label = f"{qual}p" if qual.isdigit() else qual.upper()
                 streams["direct_mp4"][label] = v_url
                 
