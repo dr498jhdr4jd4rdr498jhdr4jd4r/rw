@@ -40,14 +40,13 @@ def get_clean_headers(request: Request):
     for k, v in request.headers.items():
         if k.lower() not in FORBIDDEN_HEADERS:
             req_headers[k] = v
-    # Ensure bypass cookie exists
     cookie = req_headers.get("cookie", "")
     if "accessAgeDisclaimerPH=1" not in cookie:
         req_headers["cookie"] = (cookie + "; accessAgeDisclaimerPH=1; platform=pc;").strip("; ")
     return req_headers
 
 # ============================================================================
-# JSON Scraper Endpoints (Now 100% Crash-Proof)
+# JSON Scraper Endpoints (Fully Safe & Crash-Proof)
 # ============================================================================
 
 @app.get("/api/explore")
@@ -63,45 +62,45 @@ async def explore(q: str = "brazzers", page: int = 1):
             return JSONResponse([])
 
         videos = []
-        blocks = re.split(r'data-video-vkey="', html, flags=re.IGNORECASE)
+        blocks = re.split(r'data-video-vkey="', html, flags=r're.IGNORECASE' if False else re.I)
         
         for block in blocks[1:]:
-            block = block[:1500]
-            vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.IGNORECASE)
-            title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.IGNORECASE)
-            thumb_match = re.search(r'(?:data-thumb_url|data-mediabook|data-src|src)="([^"]+\.(?:jpg|jpeg|png|webp|gif)[^"]*)"', block, re.IGNORECASE)
-            dur_match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.IGNORECASE)
+            try:
+                block = block[:1500]
+                vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
+                title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
+                thumb_match = re.search(r'(?:data-thumb_url|data-mediabook|data-src|src)="([^"]+\.(?:jpg|jpeg|png|webp|gif)[^"]*)"', block, re.I)
+                dur_match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.I)
 
-            if vkey_match and title_match and thumb_match:
-                vkey = vkey_match.group(1)
-                title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip()
-                thumb = thumb_match.group(1)
-                if thumb.startswith('//'): thumb = 'https:' + thumb
-                
-                dur = "HD"
-                if dur_match:
-                    # Safety fallback if duration regex groups are None
-                    raw_dur = dur_match.group(1) or dur_match.group(2)
-                    if raw_dur:
-                        dur = raw_dur.strip()
-                
-                is_ad = re.search(r'\b(sponsor|promo|banner|signup|premium ads)\b', title, re.IGNORECASE)
-                
-                if not is_ad and not any(v['vkey'] == vkey for v in videos):
-                    videos.append({
-                        "vkey": vkey,
-                        "title": title,
-                        "thumbnail": thumb,
-                        "duration": dur,
-                        "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
-                        "provider": "pornhub"
-                    })
-            if len(videos) >= 48: break
+                if vkey_match and title_match and thumb_match:
+                    vkey = vkey_match.group(1)
+                    title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip()
+                    thumb = thumb_match.group(1)
+                    if thumb.startswith('//'): thumb = 'https:' + thumb
+                    
+                    dur = "HD"
+                    if dur_match:
+                        raw_dur = dur_match.group(1) or dur_match.group(2)
+                        if raw_dur:
+                            dur = raw_dur.strip()
+                    
+                    is_ad = re.search(r'\b(sponsor|promo|banner|signup|premium ads)\b', title, re.I)
+                    
+                    if not is_ad and not any(v['vkey'] == vkey for v in videos):
+                        videos.append({
+                            "vkey": vkey,
+                            "title": title,
+                            "thumbnail": thumb,
+                            "duration": dur,
+                            "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
+                            "provider": "pornhub"
+                        })
+                if len(videos) >= 48: break
+            except Exception:
+                continue 
         
         return JSONResponse(videos)
     except Exception as e:
-        # Prevents 500 error from crashing the UI
-        print(f"Explore Error: {e}")
         return JSONResponse([])
 
 @app.get("/api/extract")
@@ -148,7 +147,7 @@ async def extract(url: str):
         streams = {"direct_mp4": {}, "qualities": []}
         
         for m in media_defs:
-            if not isinstance(m, dict): continue # Prevent dict crash
+            if not isinstance(m, dict): continue
             v_url = m.get("videoUrl") or m.get("url")
             if not v_url: continue
             
@@ -188,7 +187,6 @@ async def extract(url: str):
             "provider": "pornhub"
         })
     except Exception as e:
-        # Guarantee JSON format response so Javascript UI doesn't crash
         return JSONResponse({"status": "error", "error": f"Internal API Error: {str(e)}"})
 
 # ============================================================================
