@@ -23,7 +23,7 @@ async def proxy_request(url: str, request: Request):
     # Forward original headers but strip host and connection to avoid conflicts
     req_headers = {}
     for k, v in request.headers.items():
-        if k.lower() not in ["host", "connection", "content-length"]:
+        if k.lower() not in ["host", "connection"]:
             req_headers[k] = v
 
     # Add browser spoofing if missing
@@ -31,8 +31,7 @@ async def proxy_request(url: str, request: Request):
     if "user-agent" not in headers_lower:
         req_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-    # CRITICAL FIX: Do not pass streams for GET requests! Read POST bodies into memory.
-    # This prevents the httpx.StreamConsumed crash when the upstream CDN triggers a redirect.
+    # Don't pass streams for GET requests! Read POST bodies into memory.
     req_content = None
     if request.method not in ["GET", "HEAD", "OPTIONS"]:
         req_content = await request.body() 
@@ -53,7 +52,9 @@ async def proxy_request(url: str, request: Request):
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
     }
     
-    for h in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]:
+    # CRITICAL FIX: Added "Content-Encoding" to the list. 
+    # This prevents the gibberish text issue when upstream sends GZIP/Brotli data.
+    for h in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Content-Encoding"]:
         if h in r.headers:
             resp_headers[h] = r.headers[h]
 
