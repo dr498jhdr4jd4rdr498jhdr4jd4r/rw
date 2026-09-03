@@ -143,7 +143,6 @@ async def extract(url: str):
                 try: media_defs = json.loads(md_match.group(1))
                 except: pass
 
-        # STRICTLY HLS ONLY (NO MP4)
         streams = {"qualities": []}
         
         for m in media_defs:
