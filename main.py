@@ -23,27 +23,32 @@ async def proxy_request(url: str, request: Request):
     # Forward original headers but strip host and connection to avoid conflicts
     req_headers = {}
     for k, v in request.headers.items():
-        if k.lower() not in ["host", "connection"]:
+        if k.lower() not in ["host", "connection", "content-length", "cf-connecting-ip", "x-forwarded-for"]:
             req_headers[k] = v
 
-    # Add browser spoofing if missing
-    headers_lower = [k.lower() for k in req_headers.keys()]
-    if "user-agent" not in headers_lower:
-        req_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    # 1. Force modern browser User-Agent
+    req_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    req_headers["Accept-Language"] = "en-US,en;q=0.9"
 
-    # Don't pass streams for GET requests! Read POST bodies into memory.
+    # 2. CRITICAL FIX: Inject Age Verification Cookie to Bypass 403 WAF Blocks
+    if "pornhub" in target_url.lower():
+        req_headers["Cookie"] = "accessAgeDisclaimerPH=1; platform=pc;"
+
+    # 3. Read POST bodies into memory; ignore streams for GET requests to prevent httpx crashes
     req_content = None
     if request.method not in ["GET", "HEAD", "OPTIONS"]:
         req_content = await request.body() 
 
-    client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
+    # 4. Strict connection pooling and 60-second timeouts to handle video streams
+    limits = httpx.Limits(max_keepalive_connections=5, max_connections=20)
+    client = httpx.AsyncClient(follow_redirects=True, timeout=60.0, limits=limits)
     req = client.build_request(request.method, target_url, headers=req_headers, content=req_content)
     
     try:
-        # Stream the response back to handle large video files and fast HTML delivery
+        # Stream the response back (crucial for M3U8 and MP4 chunks)
         r = await client.send(req, stream=True)
     except httpx.TimeoutException:
-        return Response(content="504 Gateway Timeout: Upstream server took too long to respond.", status_code=504)
+        return Response(content="504 Gateway Timeout: Upstream CDN took too long.", status_code=504)
     except Exception as e:
         return Response(content=f"502 Proxy Error: {str(e)}", status_code=502)
     
@@ -52,8 +57,7 @@ async def proxy_request(url: str, request: Request):
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
     }
     
-    # CRITICAL FIX: Added "Content-Encoding" to the list. 
-    # This prevents the gibberish text issue when upstream sends GZIP/Brotli data.
+    # 5. Forward encoding and range headers so Cloudflare UI can play the videos
     for h in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Content-Encoding"]:
         if h in r.headers:
             resp_headers[h] = r.headers[h]
