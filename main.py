@@ -143,7 +143,7 @@ async def extract(url: str):
                 try: media_defs = json.loads(md_match.group(1))
                 except: pass
 
-        streams = {"qualities": []}
+        streams = {"direct_mp4": {}, "qualities": []}
         
         for m in media_defs:
             if not isinstance(m, dict): continue
@@ -151,6 +151,18 @@ async def extract(url: str):
             if not v_url: continue
             
             fmt = m.get("format", "")
+            qual = "Auto"
+            q_raw = m.get("quality")
+            if isinstance(q_raw, list) and len(q_raw) > 0:
+                qual = str(q_raw[0])
+            elif q_raw:
+                qual = str(q_raw)
+            if not qual or qual == "[]": qual = "Auto"
+            
+            if fmt == "mp4" or "mp4" in v_url:
+                label = f"{qual}p" if qual.isdigit() else qual.upper()
+                streams["direct_mp4"][label] = v_url
+                
             if fmt == "hls" or ".m3u8" in v_url:
                 try:
                     m3_r = await http_client.get(v_url, headers=headers)
@@ -176,11 +188,10 @@ async def extract(url: str):
                     if not any(q['url'] == v_url for q in streams["qualities"]):
                         streams["qualities"].append({"quality": "Auto", "url": v_url})
 
-        if not streams["qualities"]:
-            m3u8_links = re.findall(r'https?:\/\/[^"\']+\.m3u8(?:\?[^"\']*)?', html)
-            for link in m3u8_links:
-                if not any(q['url'] == link for q in streams["qualities"]):
-                    streams["qualities"].append({"quality": "Auto", "url": link})
+        if not streams["qualities"] and not streams["direct_mp4"]:
+            mp4_links = re.findall(r'https?:\/\/[^"\']+\.mp4(?:\?[^"\']*)?', html)
+            for link in mp4_links:
+                streams["direct_mp4"]["Auto"] = link
 
         return JSONResponse({
             "status": "success",
