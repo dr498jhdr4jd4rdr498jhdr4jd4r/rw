@@ -45,10 +45,6 @@ def get_clean_headers(request: Request):
         req_headers["cookie"] = (cookie + "; accessAgeDisclaimerPH=1; platform=pc;").strip("; ")
     return req_headers
 
-# ============================================================================
-# JSON Scraper Endpoints
-# ============================================================================
-
 @app.get("/api/explore")
 async def explore(q: str = "brazzers", page: int = 1):
     try:
@@ -109,10 +105,8 @@ async def extract(url: str):
         if not url:
             return JSONResponse({"status": "error", "error": "URL parameter is missing"})
 
-        # Safely extract viewkey from multiple possible URL variations
         vkey_match = re.search(r'viewkey=([a-z0-9]+)', url, re.I)
         if not vkey_match:
-            # Fallback for embed or short links matching alphanumeric keys
             alt_match = re.search(r'embed/([a-z0-9]+)', url, re.I)
             if alt_match:
                 vkey = alt_match.group(1)
@@ -171,7 +165,7 @@ async def extract(url: str):
             if not qual or qual == "[]": qual = "Auto"
             
             if fmt == "mp4" or "mp4" in v_url:
-                label = f"{qual}p" if qual.isdigit() else qual.upper()
+                label = f"{qual}p" if qual.isdigit() else qual.toUpperCase()
                 streams["direct_mp4"][label] = v_url
                 
             if fmt == "hls" or ".m3u8" in v_url:
@@ -207,10 +201,6 @@ async def extract(url: str):
         })
     except Exception as e:
         return JSONResponse({"status": "error", "error": f"Internal API Error: {str(e)}"})
-
-# ============================================================================
-# Streaming Media Proxy Endpoints
-# ============================================================================
 
 @app.api_route("/proxy-video", methods=["GET", "OPTIONS", "HEAD"])
 async def proxy_video(url: str, request: Request):
