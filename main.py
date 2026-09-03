@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Railway VexoStream API", lifespan=lifespan)
+app = FastAPI(title="Railway VexoStream HLS API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
