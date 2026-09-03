@@ -30,11 +30,17 @@ async def proxy_request(url: str, request: Request):
     if "user-agent" not in req_headers:
         req_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-    client = httpx.AsyncClient(follow_redirects=True)
+    # FIX: Increased timeout to 60 seconds to prevent httpx.ReadTimeout crashes
+    client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
     req = client.build_request(request.method, target_url, headers=req_headers, content=request.stream())
     
-    # Stream the response back to handle large video files and fast HTML delivery
-    r = await client.send(req, stream=True)
+    try:
+        # Stream the response back to handle large video files and fast HTML delivery
+        r = await client.send(req, stream=True)
+    except httpx.TimeoutException:
+        return Response(content="504 Gateway Timeout: Upstream server took too long to respond.", status_code=504)
+    except Exception as e:
+        return Response(content=f"502 Proxy Error: {str(e)}", status_code=502)
     
     resp_headers = {
         "Access-Control-Allow-Origin": "*",
