@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     yield
     await http_client.aclose()
 
-app = FastAPI(title="Railway VexoStream HLS API", lifespan=lifespan)
+app = FastAPI(title="Railway VexoStream API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -133,7 +133,7 @@ async def extract(url: str):
         poster = ""
         media_defs = []
         
-        fv_match = re.search(r'flashvars(?:_\d+)?\s*=\s*(\{.*?\});', html, re.DOTALL)
+        fv_match = re.search(r'flashvars_\d+\s*=\s*(\{.*?\});', html, re.DOTALL) or re.search(r'flashvars\s*=\s*(\{.*?\});', html, re.DOTALL) or re.search(r'var\s+playerObjList\s*=\s*(\{.*?\});', html, re.DOTALL)
         if fv_match:
             try:
                 data = json.loads(fv_match.group(1))
@@ -149,12 +149,15 @@ async def extract(url: str):
                 except: pass
 
         qualities = []
+        direct_mp4 = {}
+
         for m in media_defs:
             if not isinstance(m, dict): continue
             v_url = m.get("videoUrl") or m.get("url")
             if not v_url: continue
             
             fmt = m.get("format", "")
+            qual = str(m.get("quality", "Auto"))
             if fmt == "hls" or ".m3u8" in v_url:
                 try:
                     m3_r = await http_client.get(v_url, headers=headers)
@@ -168,8 +171,7 @@ async def extract(url: str):
                                 height = "0"
                                 if res_match and res_match.group(1) and 'x' in res_match.group(1):
                                     parts = res_match.group(1).split('x')
-                                    if len(parts) > 1:
-                                        height = parts[1]
+                                    if len(parts) > 1: height = parts[1]
                                 lbl = f"{height}p" if height.isdigit() and int(height)>0 else "Auto"
                                 if i+1 < len(lines) and not lines[i+1].startswith("#"):
                                     uri = lines[i+1].strip()
@@ -179,6 +181,9 @@ async def extract(url: str):
                 except:
                     if not any(q['url'] == v_url for q in qualities):
                         qualities.append({"quality": "Auto", "url": v_url})
+            elif fmt == "mp4" or "mp4" in v_url:
+                label = f"{qual}p" if qual.isdigit() else qual.upper()
+                direct_mp4[label] = v_url
 
         if not qualities:
             m3u8_links = re.findall(r'https?:\/\/[^"\']+\.m3u8(?:\?[^"\']*)?', html)
@@ -186,11 +191,20 @@ async def extract(url: str):
                 if not any(q['url'] == link for q in qualities):
                     qualities.append({"quality": "Auto", "url": link})
 
+        if not direct_mp4:
+            mp4_links = re.findall(r'https?:\/\/[^"\']+\.mp4(?:\?[^"\']*)?', html)
+            for link in mp4_links:
+                direct_mp4["Auto"] = link
+
+        if not title or title == "Unknown Title":
+            og = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, re.I)
+            if og: title = og.group(1).replace(" - Pornhub.com", "")
+
         return JSONResponse({
             "status": "success",
             "title": title.strip(),
             "thumbnail": poster,
-            "streams": {"qualities": qualities},
+            "streams": {"qualities": qualities, "direct_mp4": direct_mp4},
             "url": target_url,
             "provider": "pornhub"
         })
