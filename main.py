@@ -142,13 +142,9 @@ async def extract(url: str):
             if md_match:
                 try: media_defs = json.loads(md_match.group(1))
                 except: pass
-                
-        if not media_defs:
-            mp4_links = re.findall(r'https?:\/\/[^"\']+\.mp4(?:\?[^"\']*)?', html)
-            for link in mp4_links:
-                media_defs.append({"videoUrl": link, "quality": "Auto", "format": "mp4"})
 
-        streams = {"direct_mp4": {}, "qualities": []}
+        # EXCLUSIVE HLS EXTRACTION (NO MP4)
+        streams = {"qualities": []}
         
         for m in media_defs:
             if not isinstance(m, dict): continue
@@ -156,18 +152,6 @@ async def extract(url: str):
             if not v_url: continue
             
             fmt = m.get("format", "")
-            qual = "Auto"
-            q_raw = m.get("quality")
-            if isinstance(q_raw, list) and len(q_raw) > 0:
-                qual = str(q_raw[0])
-            elif q_raw:
-                qual = str(q_raw)
-            if not qual or qual == "[]": qual = "Auto"
-            
-            if fmt == "mp4" or "mp4" in v_url:
-                label = f"{qual}p" if qual.isdigit() else qual.upper()
-                streams["direct_mp4"][label] = v_url
-                
             if fmt == "hls" or ".m3u8" in v_url:
                 try:
                     m3_r = await http_client.get(v_url, headers=headers)
@@ -187,9 +171,18 @@ async def extract(url: str):
                                 if i+1 < len(lines) and not lines[i+1].startswith("#"):
                                     uri = lines[i+1].strip()
                                     abs_uri = uri if uri.startswith("http") else urljoin(base_url, uri)
-                                    streams["qualities"].append({"quality": lbl, "url": abs_uri})
+                                    if not any(q['url'] == abs_uri for q in streams["qualities"]):
+                                        streams["qualities"].append({"quality": lbl, "url": abs_uri})
                 except:
-                    streams["qualities"].append({"quality": "Auto", "url": v_url})
+                    if not any(q['url'] == v_url for q in streams["qualities"]):
+                        streams["qualities"].append({"quality": "Auto", "url": v_url})
+
+        # Fallback if no HLS master found directly in media definitions
+        if not streams["qualities"]:
+            m3u8_links = re.findall(r'https?:\/\/[^"\']+\.m3u8(?:\?[^"\']*)?', html)
+            for link in m3u8_links:
+                if not any(q['url'] == link for q in streams["qualities"]):
+                    streams["qualities"].append({"quality": "Auto", "url": link})
 
         return JSONResponse({
             "status": "success",
