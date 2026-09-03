@@ -36,7 +36,12 @@ app.add_middleware(
 )
 
 def get_clean_headers(request: Request):
-    req_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36", "Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.pornhub.com/"}
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36", 
+        "Accept-Language": "en-US,en;q=0.9", 
+        "Referer": "https://www.pornhub.com/",
+        "Origin": "https://www.pornhub.com"
+    }
     for k, v in request.headers.items():
         if k.lower() not in FORBIDDEN_HEADERS:
             req_headers[k] = v
