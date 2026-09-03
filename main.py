@@ -144,7 +144,6 @@ async def extract(url: str):
                 except: pass
 
         qualities = []
-        
         for m in media_defs:
             if not isinstance(m, dict): continue
             v_url = m.get("videoUrl") or m.get("url")
@@ -186,9 +185,7 @@ async def extract(url: str):
             "status": "success",
             "title": title.strip(),
             "thumbnail": poster,
-            "streams": {
-                "qualities": qualities
-            },
+            "streams": {"qualities": qualities},
             "url": target_url,
             "provider": "pornhub"
         })
@@ -222,7 +219,7 @@ async def proxy_image(url: str, request: Request):
         return Response(status_code=404)
 
 @app.api_route("/proxy-m3u8", methods=["GET"])
-async def proxy_m3u8(url: str, request: Request, request_obj: Request):
+async def proxy_m3u8(url: str, request: Request):
     target = unquote(url)
     req_headers = get_clean_headers(request)
     r = await http_client.get(target, headers=req_headers)
@@ -231,7 +228,7 @@ async def proxy_m3u8(url: str, request: Request, request_obj: Request):
         return Response(status_code=r.status_code)
         
     base = target[:target.rfind('/')+1]
-    cf_host = f"{request_obj.url.scheme}://{request_obj.headers.get('host')}"
+    cf_host = f"{request.url.scheme}://{request.headers.get('host')}"
     
     rewritten = []
     for line in r.text.splitlines():
