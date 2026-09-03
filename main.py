@@ -150,7 +150,6 @@ async def extract(url: str):
 
         qualities = []
         direct_mp4 = {}
-
         for m in media_defs:
             if not isinstance(m, dict): continue
             v_url = m.get("videoUrl") or m.get("url")
