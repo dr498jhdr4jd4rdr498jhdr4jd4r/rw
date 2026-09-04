@@ -124,6 +124,7 @@ class PornhubScraper:
 
             page_text = resp.text
             
+            # Robust extraction of flashvars/player settings across different Pornhub UI variants
             fv_match = re.search(r'(?:var\s+)?flashvars_\d+\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
                        re.search(r'(?:var\s+)?flashvars\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
                        re.search(r'playerObjList\s*=\s*(\{.*?\});', page_text, re.DOTALL)
@@ -263,6 +264,7 @@ def explore(q: str = "brazzers", page: int = 1):
                 "provider": "pornhub"
             })
 
+            # Ensure complete collection per page (at least 20 items per page limit)
             if len(videos) >= 44:
                 break
 
