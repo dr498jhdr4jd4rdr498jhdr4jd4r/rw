@@ -4,9 +4,9 @@ import httpx
 import logging
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urljoin, unquote
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -21,12 +21,12 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(35.0, connect=10.0),
         limits=httpx.Limits(max_connections=400, max_keepalive_connections=80)
     )
-    logger.info("Railway Scraper Core Started.")
+    logger.info("Railway Backend Engine Active.")
     yield
     await http_client.aclose()
-    logger.info("Railway Scraper Core Stopped.")
+    logger.info("Railway Backend Engine Inactive.")
 
-app = FastAPI(title="VexoStream Enterprise Scraper", lifespan=lifespan)
+app = FastAPI(title="VexoStream Core API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,7 +48,6 @@ def extract_balanced_json(text: str, trigger_key: str):
     idx = text.find(trigger_key)
     if idx == -1:
         return None
-    
     start_pos = -1
     is_array = False
     for i in range(idx + len(trigger_key), len(text)):
@@ -62,7 +61,6 @@ def extract_balanced_json(text: str, trigger_key: str):
             break
         elif text[i] in [';', '\n'] and i > idx + 50:
             break
-            
     if start_pos == -1:
         return None
 
@@ -132,8 +130,6 @@ class MediaExtractor:
 async def explore(q: str = "brazzers", page: int = 1):
     try:
         target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
-        logger.info(f"Scraping Page {page}: {target_url}")
-
         try:
             r = await http_client.get(target_url, headers=get_clean_headers())
             html = r.text
@@ -184,7 +180,6 @@ async def explore(q: str = "brazzers", page: int = 1):
             except Exception:
                 continue
 
-        logger.info(f"Page {page} Extracted: {len(videos)} videos.")
         return JSONResponse(videos)
     except Exception as e:
         logger.error(f"Explore Endpoint Error: {e}")
@@ -299,34 +294,6 @@ async def extract(url: str):
                     "type": "hls" if is_hls else "mp4"
                 }
 
-        if not qualities_dict:
-            clean_html = html.replace(r"\/", "/")
-            m3u8_links = re.findall(r'(https?://[^"\'\s<>]+\.m3u8[^"\'\s<>]*)', clean_html)
-            for link in m3u8_links:
-                try:
-                    m3_r = await http_client.get(link, headers={"User-Agent": get_clean_headers()["User-Agent"], "Referer": "https://www.pornhub.com/"})
-                    if m3_r.status_code == 200 and "#EXT-X-STREAM-INF" in m3_r.text:
-                        lines = m3_r.text.splitlines()
-                        base_url = link[:link.rfind('/')+1]
-                        for i, line in enumerate(lines):
-                            if line.startswith("#EXT-X-STREAM-INF:"):
-                                res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
-                                if res_match:
-                                    parsed_q = f"{res_match.group(1).split('x')[1]}p"
-                                    if i + 1 < len(lines):
-                                        sub_uri = lines[i+1].strip()
-                                        if not sub_uri.startswith("#"):
-                                            abs_uri = sub_uri if sub_uri.startswith("http") else urljoin(base_url, sub_uri)
-                                            if parsed_q not in qualities_dict:
-                                                qualities_dict[parsed_q] = {"quality": parsed_q, "url": abs_uri, "type": "hls"}
-                except Exception:
-                    pass
-                if qualities_dict:
-                    break
-
-            if not qualities_dict and m3u8_links:
-                qualities_dict["Adaptive HD"] = {"quality": "Adaptive HD", "url": m3u8_links[0], "type": "hls"}
-
         qualities = list(qualities_dict.values())
 
         def get_res(q):
@@ -346,6 +313,16 @@ async def extract(url: str):
     except Exception as e:
         logger.error(f"Extract API Error: {e}")
         return JSONResponse({"status": "error", "error": f"Internal API Error: {str(e)}"})
+
+@app.get("/proxy-image")
+async def fallback_proxy_image(url: str):
+    """Fallback high-speed image streamer."""
+    try:
+        req = http_client.build_request("GET", unquote(url), headers=get_clean_headers())
+        r = await http_client.send(req, stream=True)
+        return StreamingResponse(r.aiter_raw(), status_code=r.status_code, headers={"Content-Type": r.headers.get("Content-Type", "image/jpeg"), "Access-Control-Allow-Origin": "*"})
+    except Exception:
+        return Response(status_code=404)
 
 @app.get("/")
 def read_root():
