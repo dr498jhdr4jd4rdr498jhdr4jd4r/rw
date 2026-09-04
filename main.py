@@ -68,26 +68,38 @@ async def explore(q: str = "brazzers", page: int = 1):
         for block in blocks[1:]:
             try:
                 block = block[:2500]
+                
+                # AD BLOCKER: Check for PH ad blocks
+                if "adblock" in block.lower() or "sponsor" in block.lower():
+                    continue
+
                 vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
                 title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
 
                 # ==========================================
-                # FIX: PERFECT THUMBNAIL SCRAPING (NO FLICKERING)
+                # FIX: STRICT IMAGE ONLY SCRAPING (NO WEBM/MP4)
                 # ==========================================
                 thumb = ""
-                # 1. Prioritize data-image or data-mediabook
-                img_match = re.search(r'data-(?:image|thumb_url|mediabook)=["\']([^"\']+)["\']', block, re.I)
+                # Removed 'mediabook' to strictly prevent .webm grabs
+                img_match = re.search(r'data-(?:image|thumb_url)=["\']([^"\']+)["\']', block, re.I)
                 if img_match:
                     thumb = img_match.group(1).replace("\\/", "/")
                 else:
-                    # 2. Fallback to src, BUT reject base64/data URIs used for lazy loading
                     src_match = re.search(r'src=["\']([^"\']+)["\']', block, re.I)
                     if src_match and not src_match.group(1).startswith("data:") and "pixel" not in src_match.group(1):
                         thumb = src_match.group(1).replace("\\/", "/")
                 
-                # Validation
+                # Validate image URL & aggressively reject WebM/MP4
                 if not thumb or 'data:image' in thumb or 'pixel' in thumb or 'blank' in thumb:
                     continue
+                if '.webm' in thumb.lower() or '.mp4' in thumb.lower():
+                    # Attempt to find a real static jpg as fallback
+                    alt_match = re.search(r'(https?://[^"\']+\.(?:jpg|webp|jpeg|png)[^"\']*)', block, re.I)
+                    if alt_match:
+                        thumb = alt_match.group(1).replace("\\/", "/")
+                    else:
+                        continue # Skip this video if no static image is found
+
                 if thumb.startswith('//'): 
                     thumb = 'https:' + thumb
                 if not thumb.startswith('http'):
@@ -106,7 +118,8 @@ async def explore(q: str = "brazzers", page: int = 1):
                         raw_dur = dur_match.group(1) or dur_match.group(2)
                         if raw_dur: dur = raw_dur.strip()
 
-                    is_ad = re.search(r'\b(sponsor|promo|banner|signup|premium ads)\b', title, re.I)
+                    # Stronger Ad Filtering
+                    is_ad = re.search(r'\b(sponsor(?:ed)?|promo(?:tion)?|banner|signup|premium|ads?|advert)\b', title, re.I)
 
                     if not is_ad and not any(v['vkey'] == vkey for v in videos):
                         videos.append({
@@ -165,9 +178,6 @@ async def extract(url: str):
 
         qualities = []
 
-        # ==========================================
-        # FIX: HIGH-ACCURACY QUALITY & HLS SCRAPER
-        # ==========================================
         for m in media_defs:
             if not isinstance(m, dict): continue
             v_url = m.get("videoUrl") or m.get("url")
