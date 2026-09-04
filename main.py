@@ -4,9 +4,9 @@ import httpx
 import logging
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urljoin, unquote
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -18,13 +18,13 @@ async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(
         follow_redirects=True,
-        timeout=httpx.Timeout(40.0, connect=15.0),
+        timeout=httpx.Timeout(35.0, connect=10.0),
         limits=httpx.Limits(max_connections=500, max_keepalive_connections=100)
     )
-    logger.info("Railway Scraper Core Started.")
+    logger.info("Railway Scraper Core Initialized.")
     yield
     await http_client.aclose()
-    logger.info("Railway Scraper Core Stopped.")
+    logger.info("Railway Scraper Core Terminated.")
 
 app = FastAPI(title="VexoStream Enterprise Scraper", lifespan=lifespan)
 
@@ -51,6 +51,57 @@ def get_stealth_headers():
         "Referer": "https://www.pornhub.com/",
         "Cookie": "accessAgeDisclaimerPH=1; platform=pc; bs=1; hasVisited=1; cookiesBanner=1;"
     }
+
+def extract_balanced_json(text: str, trigger_key: str):
+    idx = text.find(trigger_key)
+    if idx == -1:
+        return None
+    
+    start_pos = -1
+    is_array = False
+    for i in range(idx + len(trigger_key), len(text)):
+        if text[i] == '{':
+            start_pos = i
+            is_array = False
+            break
+        elif text[i] == '[':
+            start_pos = i
+            is_array = True
+            break
+        elif text[i] in [';', '\n'] and i > idx + 50:
+            break
+            
+    if start_pos == -1:
+        return None
+
+    open_char = '[' if is_array else '{'
+    close_char = ']' if is_array else '}'
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i in range(start_pos, len(text)):
+        char = text[i]
+        if escape:
+            escape = False
+            continue
+        if char == '\\':
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if not in_string:
+            if char == open_char:
+                depth += 1
+            elif char == close_char:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start_pos:i+1])
+                    except Exception:
+                        return None
+    return None
 
 class MediaExtractor:
     @staticmethod
@@ -88,36 +139,35 @@ class MediaExtractor:
 @app.get("/api/explore")
 async def explore(q: str = "brazzers", page: int = 1):
     try:
-        # Strategy 1: Standard Desktop Search
         target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
         html = ""
-        
+
         try:
             r = await http_client.get(target_url, headers=get_stealth_headers())
             if r.status_code == 200 and "data-video-vkey" in r.text:
                 html = r.text
             else:
-                logger.warning(f"Strategy 1 blocked with status {r.status_code}. Trying mobile fallback...")
+                logger.warning(f"Standard fetch failed with code {r.status_code}. Invoking mobile headers...")
         except Exception as err:
             logger.error(f"Search request failed: {err}")
 
-        # Strategy 2: Mobile Fallback if blocked
         if not html:
             try:
                 m_headers = get_stealth_headers()
                 m_headers["User-Agent"] = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
                 m_headers["Cookie"] = "accessAgeDisclaimerPH=1; platform=mobile;"
-                r_m = await http_client.get(f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}", headers=m_headers)
+                r_m = await http_client.get(target_url, headers=m_headers)
                 if r_m.status_code == 200:
                     html = r_m.text
             except Exception as e:
-                logger.error(f"Strategy 2 failed: {e}")
+                logger.error(f"Mobile fallback failed: {e}")
 
         if not html:
             return JSONResponse([])
 
         videos = []
         blocks = re.split(r'data-video-vkey=["\']|data-vkey=["\']', html, flags=re.I)
+        search_terms = [term.strip().lower() for term in q.split() if term.strip()]
 
         for block in blocks[1:]:
             try:
@@ -135,6 +185,10 @@ async def explore(q: str = "brazzers", page: int = 1):
                 title = MediaExtractor.clean_title(title_raw)
 
                 if MediaExtractor.is_ad(title):
+                    continue
+
+                title_lower = title.lower()
+                if search_terms and not all(term in title_lower for term in search_terms):
                     continue
 
                 thumb = MediaExtractor.extract_thumbnail(sub_block)
@@ -160,7 +214,7 @@ async def explore(q: str = "brazzers", page: int = 1):
             except Exception:
                 continue
 
-        logger.info(f"Page {page}: successfully extracted {len(videos)} videos.")
+        logger.info(f"Page {page}: successfully extracted {len(videos)} matching videos.")
         return JSONResponse(videos)
     except Exception as e:
         logger.error(f"Explore Endpoint Failure: {e}")
@@ -189,25 +243,17 @@ async def extract(url: str):
         poster = ""
         media_defs = []
 
-        fv_match = re.search(r'flashvars_\d+\s*=\s*(\{.*?\});', html, re.DOTALL) or \
-                   re.search(r'flashvars\s*=\s*(\{.*?\});', html, re.DOTALL) or \
-                   re.search(r'var\s+playerObjList\s*=\s*(\{.*?\});', html, re.DOTALL)
-        if fv_match:
-            try:
-                data = json.loads(fv_match.group(1))
-                media_defs = data.get("mediaDefinitions", [])
-                title = data.get("video_title", "")
-                poster = data.get("image_url") or data.get("thumb_url") or ""
-            except Exception:
-                pass
+        flashvars_data = extract_balanced_json(html, "flashvars_") or \
+                         extract_balanced_json(html, "playerObjList_") or \
+                         extract_balanced_json(html, "flashvars")
+
+        if flashvars_data and isinstance(flashvars_data, dict):
+            media_defs = flashvars_data.get("mediaDefinitions", [])
+            title = flashvars_data.get("video_title", "")
+            poster = flashvars_data.get("image_url") or flashvars_data.get("thumb_url") or ""
 
         if not media_defs:
-            md_raw = re.search(r'"mediaDefinitions"\s*:\s*(\[\{.*?\}\])', html, re.DOTALL)
-            if md_raw:
-                try:
-                    media_defs = json.loads(md_raw.group(1))
-                except Exception:
-                    pass
+            media_defs = extract_balanced_json(html, '"mediaDefinitions"') or []
 
         if not title:
             h1_match = re.search(r'<h1[^>]*class="[^"]*title[^"]*"[^>]*>(?:<span[^>]*class="inlineFree"[^>]*>)?([^<]+)', html, re.I)
@@ -283,6 +329,34 @@ async def extract(url: str):
                     "type": "hls" if is_hls else "mp4"
                 }
 
+        if not qualities_dict:
+            clean_html = html.replace(r"\/", "/")
+            m3u8_links = re.findall(r'(https?://[^"\'\s<>]+\.m3u8[^"\'\s<>]*)', clean_html)
+            for link in m3u8_links:
+                try:
+                    m3_r = await http_client.get(link, headers={"User-Agent": get_stealth_headers()["User-Agent"], "Referer": "https://www.pornhub.com/"})
+                    if m3_r.status_code == 200 and "#EXT-X-STREAM-INF" in m3_r.text:
+                        lines = m3_r.text.splitlines()
+                        base_url = link[:link.rfind('/')+1]
+                        for i, line in enumerate(lines):
+                            if line.startswith("#EXT-X-STREAM-INF:"):
+                                res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
+                                if res_match:
+                                    parsed_q = f"{res_match.group(1).split('x')[1]}p"
+                                    if i + 1 < len(lines):
+                                        sub_uri = lines[i+1].strip()
+                                        if not sub_uri.startswith("#"):
+                                            abs_uri = sub_uri if sub_uri.startswith("http") else urljoin(base_url, sub_uri)
+                                            if parsed_q not in qualities_dict:
+                                                qualities_dict[parsed_q] = {"quality": parsed_q, "url": abs_uri, "type": "hls"}
+                except Exception:
+                    pass
+                if qualities_dict:
+                    break
+
+            if not qualities_dict and m3u8_links:
+                qualities_dict["Adaptive HD"] = {"quality": "Adaptive HD", "url": m3u8_links[0], "type": "hls"}
+
         qualities = list(qualities_dict.values())
 
         def get_res(q):
@@ -308,7 +382,14 @@ async def fallback_proxy_image(url: str):
     try:
         req = http_client.build_request("GET", unquote(url), headers=get_stealth_headers())
         r = await http_client.send(req, stream=True)
-        return StreamingResponse(r.aiter_raw(), status_code=r.status_code, headers={"Content-Type": r.headers.get("Content-Type", "image/jpeg"), "Access-Control-Allow-Origin": "*"})
+        return StreamingResponse(
+            r.aiter_raw(),
+            status_code=r.status_code,
+            headers={
+                "Content-Type": r.headers.get("Content-Type", "image/jpeg"),
+                "Access-Control-Allow-Origin": "*"
+            }
+        )
     except Exception:
         return Response(status_code=404)
 
