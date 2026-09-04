@@ -166,6 +166,14 @@ async def extract(url: str):
             v_url = m.get("videoUrl") or m.get("url")
             if not v_url: continue
 
+            # اگر quality مستقیماً توی خود تعریف مدیا وجود داشت
+            direct_quality = m.get("quality") or m.get("height")
+            if direct_quality and str(direct_quality).isdigit():
+                lbl = f"{direct_quality}p"
+                if not any(q['url'] == v_url for q in qualities):
+                    qualities.append({"quality": lbl, "url": v_url})
+                continue
+
             fmt = m.get("format", "")
             if fmt == "hls" or ".m3u8" in v_url:
                 try:
@@ -181,23 +189,37 @@ async def extract(url: str):
                                 if res_match and res_match.group(1) and 'x' in res_match.group(1):
                                     parts = res_match.group(1).split('x')
                                     if len(parts) > 1: height = parts[1]
+                                
+                                # اگر رزولوشن پیدا نشد از روی بقیه پارامترها یا نام فایل حدس بزن
                                 lbl = f"{height}p" if height.isdigit() and int(height)>0 else ""
-                                if lbl and i+1 < len(lines) and not lines[i+1].startswith("#"):
+                                
+                                if i+1 < len(lines) and not lines[i+1].startswith("#"):
                                     uri = lines[i+1].strip()
                                     abs_uri = uri if uri.startswith("http") else urljoin(base_url, uri)
+                                    
+                                    # اگر ارتفاع در سطر بالا نبود، از روی نام فایل m3u8 حدس بزن
+                                    if not lbl or lbl == "0p":
+                                        if "1080" in abs_uri: lbl = "1080p"
+                                        elif "720" in abs_uri: lbl = "720p"
+                                        elif "480" in abs_uri: lbl = "480p"
+                                        elif "360" in abs_uri: lbl = "360p"
+                                        else: lbl = f"Stream {len(qualities)+1}"
+
                                     if not any(q['url'] == abs_uri for q in qualities):
                                         qualities.append({"quality": lbl, "url": abs_uri})
                 except:
                     pass
 
-        if not qualities:
-            clean_html = html.replace('\\/', '/')
-            m3u8_links = set(re.findall(r'(https?:\/\/[^"\'\s]+\.m3u8(?:[^\'"]*))', clean_html))
-            for link in m3u8_links:
-                if "master.m3u8" in link or "index.m3u8" in link:
-                    if not any(q['url'] == link for q in qualities):
-                        qualities.append({"quality": "Source", "url": link})
+        # پشتیبانی از متد جایگزین استخراج کیفیت‌های مستقیم MP4 اگر HLS نبود
+        for m in media_defs:
+            if not isinstance(m, dict): continue
+            v_url = m.get("videoUrl") or m.get("url")
+            if v_url and ".mp4" in v_url and not any(q['url'] == v_url for q in qualities):
+                q_lbl = str(m.get("height") or m.get("quality") or "HD")
+                if not q_lbl.endswith("p") and q_lbl.isdigit(): q_lbl += "p"
+                qualities.append({"quality": q_lbl, "url": v_url})
 
+        # مرتب‌سازی کیفیت‌ها از بیشترین به کمترین رزولوشن
         def get_res(q):
             num = re.sub(r'\D', '', q['quality'])
             return int(num) if num else 0
