@@ -125,15 +125,12 @@ class PornhubScraper:
                 return {"status": "error", "error": "Failed to fetch source page from upstream", "url": url}
 
             page_text = resp.text
-            
-            # Multi-pattern extraction for flashvars / player objects
             patterns = [
                 r'(?:var\s+)?flashvars_\d+\s*=\s*(\{.*?\});',
                 r'(?:var\s+)?flashvars\s*=\s*(\{.*?\});',
                 r'playerObjList\s*=\s*(\{.*?\});',
                 r'video_lookup\s*=\s*(\{.*?\});'
             ]
-            
             data = None
             for pat in patterns:
                 m = re.search(pat, page_text, re.DOTALL)
@@ -226,69 +223,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def fetch_videos_from_page(q: str, page_num: int):
+    search_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page_num}"
+    resp = scraper._fetch_page(search_url, referer="https://www.pornhub.com/")
+    if not resp or resp.status_code != 200:
+        return []
+
+    tree = html.fromstring(resp.content)
+    items = tree.xpath('//li[contains(@class, "pcVideoListItem")]')
+    if not items:
+        items = tree.xpath('//div[contains(@class, "wrap")]//ul[@id="videobreakdown"]//li | //ul[@id="videoSearchResult"]//li | //div[contains(@class, "videoBox")]')
+
+    videos = []
+    search_words = [w.strip().lower() for w in q.split() if w.strip()]
+
+    for item in items:
+        vkey = item.get("data-video-vkey")
+        if not vkey:
+            vkey_attr = item.xpath('.//@data-video-vkey | .//@data-vkey')
+            if vkey_attr:
+                vkey = vkey_attr[0]
+
+        if not vkey:
+            hrefs = item.xpath('.//a/@href')
+            for h in hrefs:
+                if 'viewkey=' in h:
+                    vk_match = re.search(r'viewkey=([a-zA-Z0-9]+)', h)
+                    if vk_match:
+                        vkey = vk_match.group(1)
+                        break
+
+        if not vkey:
+            continue
+
+        title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text() | .//a/@title')
+        if not title_elem:
+            title_elem = item.xpath('.//img/@alt')
+        title = title_elem[0].strip() if title_elem else "Unknown Video"
+
+        title_lower = title.lower()
+        if search_words and not all(w in title_lower for w in search_words):
+            continue
+
+        raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@data-src | .//img/@src')
+        clean_thumbs = scraper.clean_thumbnails(raw_thumbs, "https://www.pornhub.com/")
+        if not clean_thumbs:
+            continue
+        thumb = clean_thumbs[0]
+
+        videos.append({
+            "vkey": vkey,
+            "title": title,
+            "thumbnail": thumb,
+            "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
+            "provider": "pornhub"
+        })
+    return videos
+
 @app.get("/api/explore")
 def explore(q: str = "brazzers", page: int = 1):
     try:
-        search_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
-        resp = scraper._fetch_page(search_url, referer="https://www.pornhub.com/")
-        if not resp or resp.status_code != 200:
-            return JSONResponse([])
-
-        tree = html.fromstring(resp.content)
-        items = tree.xpath('//li[contains(@class, "pcVideoListItem")]')
-        if not items:
-            items = tree.xpath('//div[contains(@class, "wrap")]//ul[@id="videobreakdown"]//li | //ul[@id="videoSearchResult"]//li | //div[contains(@class, "videoBox")]')
-
-        videos = []
-        search_words = [w.strip().lower() for w in q.split() if w.strip()]
-
-        for item in items:
-            vkey = item.get("data-video-vkey")
-            if not vkey:
-                vkey_attr = item.xpath('.//@data-video-vkey | .//@data-vkey')
-                if vkey_attr:
-                    vkey = vkey_attr[0]
-
-            if not vkey:
-                # Fallback to parse href patterns containing viewkey
-                hrefs = item.xpath('.//a/@href')
-                for h in hrefs:
-                    if 'viewkey=' in h:
-                        vk_match = re.search(r'viewkey=([a-zA-Z0-9]+)', h)
-                        if vk_match:
-                            vkey = vk_match.group(1)
-                            break
-
-            if not vkey:
-                continue
-
-            title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text() | .//a/@title')
-            if not title_elem:
-                title_elem = item.xpath('.//img/@alt')
-            title = title_elem[0].strip() if title_elem else "Unknown Video"
-
-            title_lower = title.lower()
-            if search_words and not all(w in title_lower for w in search_words):
-                continue
-
-            raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@data-src | .//img/@src')
-            clean_thumbs = scraper.clean_thumbnails(raw_thumbs, "https://www.pornhub.com/")
-            if not clean_thumbs:
-                continue
-            thumb = clean_thumbs[0]
-
-            videos.append({
-                "vkey": vkey,
-                "title": title,
-                "thumbnail": thumb,
-                "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
-                "provider": "pornhub"
-            })
-
-            if len(videos) >= 44:
-                break
-
-        return JSONResponse(videos)
+        videos = fetch_videos_from_page(q, page)
+        
+        # اگر تعداد نتایج صفحه اول کمتر از 20 بود، صفحه دوم را هم به طور خودکار بارگذاری می‌کنیم تا حداقل 20 تا شود
+        if len(videos) < 20 and page == 1:
+            videos_page_2 = fetch_videos_from_page(q, 2)
+            existing_vkeys = {v['vkey'] for v in videos}
+            for v in videos_page_2:
+                if v['vkey'] not in existing_vkeys:
+                    videos.append(v)
+                    existing_vkeys.add(v['vkey'])
+        
+        return JSONResponse(videos[:44])
     except Exception as e:
         logger.error(f"Explore error: {e}")
         return JSONResponse([])
