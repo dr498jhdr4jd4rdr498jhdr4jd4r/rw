@@ -21,7 +21,7 @@ class PornhubScraper:
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
             'Referer': 'https://www.pornhub.com/',
-            'Cookie': 'accessAgeDisclaimerPH=1; age_verified=1; platform=pc; hasVisited=1; cookiesBanner=1;'
+            'Cookie': 'accessAgeDisclaimerPH=1; age_verified=1; platform=pc; hasVisited=1; cookiesBanner=1; bs=1'
         }
         self.proxies = {
             "http": os.getenv("HTTP_PROXY", ""),
@@ -129,17 +129,22 @@ class PornhubScraper:
                 r'(?:var\s+)?flashvars_\d+\s*=\s*(\{.*?\});',
                 r'(?:var\s+)?flashvars\s*=\s*(\{.*?\});',
                 r'playerObjList\s*=\s*(\{.*?\});',
-                r'video_lookup\s*=\s*(\{.*?\});'
+                r'video_lookup\s*=\s*(\{.*?\});',
+                r'olonplayer\.inds\s*=\s*(\{.*?\});'
             ]
             data = None
             for pat in patterns:
-                m = re.search(pat, page_text, re.DOTALL)
-                if m:
+                matches = re.finditer(pat, page_text, re.DOTALL)
+                for m in matches:
                     try:
-                        data = json.loads(m.group(1))
-                        break
+                        parsed = json.loads(m.group(1))
+                        if isinstance(parsed, dict) and ('mediaDefinitions' in parsed or 'videoUrl' in str(parsed)):
+                            data = parsed
+                            break
                     except Exception:
                         continue
+                if data:
+                    break
 
             if data and isinstance(data, dict):
                 media_defs = data.get('mediaDefinitions', [])
