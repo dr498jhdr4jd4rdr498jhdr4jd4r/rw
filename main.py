@@ -36,7 +36,7 @@ class PornhubScraper:
             parsed = urlparse(url)
             headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
 
-        for _ in range(2):  # Retry mechanism for first-time reliable fetch
+        for _ in range(2):
             try:
                 resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
                 if resp.status_code == 200:
@@ -96,7 +96,6 @@ class PornhubScraper:
         except Exception:
             pass
 
-        # Fallback parsing if standard resolution tags are formatted differently
         if not qualities:
             try:
                 resp = self._fetch_page(master_m3u8_url, referer)
@@ -140,7 +139,6 @@ class PornhubScraper:
 
             page_text = resp.text
             
-            # Deep search for player flashvars and media definitions
             fv_match = re.search(r'(?:var\s+)?flashvars_\d+\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
                        re.search(r'(?:var\s+)?flashvars\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
                        re.search(r'playerObjList\s*=\s*(\{.*?\});', page_text, re.DOTALL)
@@ -182,7 +180,6 @@ class PornhubScraper:
         stream_data = {"qualities": []}
         seen_q = set()
 
-        # Prioritize HLS master playlists to collect all resolutions on the first attempt
         for m in media_defs:
             if not isinstance(m, dict):
                 continue
@@ -249,43 +246,57 @@ def explore(q: str = "brazzers", page: int = 1):
         videos = []
         search_words = [w.strip().lower() for w in q.split() if w.strip()]
 
+        # Phase 1: Try strict match first
         for item in items:
-            vkey = item.get("data-video-vkey")
-            if not vkey:
-                vkey_attr = item.xpath('.//@data-video-vkey')
-                if vkey_attr:
-                    vkey = vkey_attr[0]
-
+            vkey = item.get("data-video-vkey") or (item.xpath('.//@data-video-vkey') or [None])[0]
             if not vkey:
                 continue
 
-            title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text()')
-            if not title_elem:
-                title_elem = item.xpath('.//img/@alt')
+            title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text() | .//img/@alt')
             title = title_elem[0].strip() if title_elem else "Unknown Video"
-
             title_lower = title.lower()
-            if search_words and not all(w in title_lower for w in search_words):
-                continue
 
-            raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@data-src | .//img/@src')
-            clean_thumbs = scraper.clean_thumbnails(raw_thumbs, "https://www.pornhub.com/")
-            if not clean_thumbs:
-                continue
-            thumb = clean_thumbs[0]
+            if not search_words or all(w in title_lower for w in search_words):
+                raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@data-src | .//img/@src')
+                clean_thumbs = scraper.clean_thumbnails(raw_thumbs, "https://www.pornhub.com/")
+                if not clean_thumbs:
+                    continue
 
-            videos.append({
-                "vkey": vkey,
-                "title": title,
-                "thumbnail": thumb,
-                "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
-                "provider": "pornhub"
-            })
+                videos.append({
+                    "vkey": vkey,
+                    "title": title,
+                    "thumbnail": clean_thumbs[0],
+                    "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
+                    "provider": "pornhub"
+                })
 
-            if len(videos) >= 44:
-                break
+        # Phase 2: If strict match gives fewer than 20 items, fill the page up to 20 using all available items from the same search result page
+        if len(videos) < 20:
+            for item in items:
+                vkey = item.get("data-video-vkey") or (item.xpath('.//@data-video-vkey') or [None])[0]
+                if not vkey or any(v["vkey"] == vkey for v in videos):
+                    continue
 
-        return JSONResponse(videos)
+                title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text() | .//img/@alt')
+                title = title_elem[0].strip() if title_elem else "Unknown Video"
+
+                raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@data-src | .//img/@src')
+                clean_thumbs = scraper.clean_thumbnails(raw_thumbs, "https://www.pornhub.com/")
+                if not clean_thumbs:
+                    continue
+
+                videos.append({
+                    "vkey": vkey,
+                    "title": title,
+                    "thumbnail": clean_thumbs[0],
+                    "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
+                    "provider": "pornhub"
+                })
+
+                if len(videos) >= 20:
+                    break
+
+        return JSONResponse(videos[:24])
     except Exception as e:
         logger.error(f"Explore error: {e}")
         return JSONResponse([])
