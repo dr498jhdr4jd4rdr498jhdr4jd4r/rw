@@ -54,7 +54,7 @@ def get_clean_headers(request: Request):
 async def explore(q: str = "brazzers", page: int = 1):
     try:
         target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}&o=mv"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"}
 
         try:
             r = await http_client.get(target_url, headers=headers)
@@ -71,21 +71,22 @@ async def explore(q: str = "brazzers", page: int = 1):
                 vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
                 title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
 
-                # FIX: Strictly target real image URLs avoiding lazy-load base64 placeholders
+                # ==========================================
+                # FIX: PERFECT THUMBNAIL SCRAPING (NO FLICKERING)
+                # ==========================================
                 thumb = ""
-                img_match = re.search(r'data-image=["\']([^"\']+)["\']', block, re.I)
-                if not img_match:
-                    img_match = re.search(r'data-thumb_url=["\']([^"\']+)["\']', block, re.I)
-                if not img_match:
-                    src_match = re.search(r'src=["\']([^"\']+)["\']', block, re.I)
-                    if src_match and not src_match.group(1).startswith("data:"):
-                        img_match = src_match
-                
+                # 1. Prioritize data-image or data-mediabook
+                img_match = re.search(r'data-(?:image|thumb_url|mediabook)=["\']([^"\']+)["\']', block, re.I)
                 if img_match:
                     thumb = img_match.group(1).replace("\\/", "/")
+                else:
+                    # 2. Fallback to src, BUT reject base64/data URIs used for lazy loading
+                    src_match = re.search(r'src=["\']([^"\']+)["\']', block, re.I)
+                    if src_match and not src_match.group(1).startswith("data:") and "pixel" not in src_match.group(1):
+                        thumb = src_match.group(1).replace("\\/", "/")
                 
-                # Check for validity
-                if not thumb or 'data:image' in thumb or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
+                # Validation
+                if not thumb or 'data:image' in thumb or 'pixel' in thumb or 'blank' in thumb:
                     continue
                 if thumb.startswith('//'): 
                     thumb = 'https:' + thumb
@@ -129,21 +130,21 @@ async def explore(q: str = "brazzers", page: int = 1):
 async def extract(url: str):
     try:
         if not url:
-            return JSONResponse({"status": "error", "error": "URL parameter is missing"})
+            return JSONResponse({"status": "error", "error": "URL missing"})
 
         vkey_match = re.search(r'viewkey=([a-z0-9]+)', url, re.I)
         if not vkey_match:
-            return JSONResponse({"status": "error", "error": "Invalid or unsupported link format."})
+            return JSONResponse({"status": "error", "error": "Invalid format"})
         vkey = vkey_match.group(1)
 
         target_url = f"https://www.pornhub.com/view_video.php?viewkey={vkey}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"}
 
         try:
             r = await http_client.get(target_url, headers=headers)
             html = r.text
         except Exception as e:
-            return JSONResponse({"status": "error", "error": f"Upstream connection failed: {str(e)}"})
+            return JSONResponse({"status": "error", "error": "Upstream error"})
 
         title, poster, media_defs = "Unknown Title", "", []
 
@@ -164,7 +165,9 @@ async def extract(url: str):
 
         qualities = []
 
-        # FIX: Robust quality scraper for both MP4 and HLS variants
+        # ==========================================
+        # FIX: HIGH-ACCURACY QUALITY & HLS SCRAPER
+        # ==========================================
         for m in media_defs:
             if not isinstance(m, dict): continue
             v_url = m.get("videoUrl") or m.get("url")
@@ -176,7 +179,6 @@ async def extract(url: str):
                 if isinstance(q_val, list) and len(q_val) > 0: q_val = str(q_val[0])
                 elif q_val: q_val = str(q_val)
                 else: q_val = ""
-                
                 if q_val.isdigit(): q_val += "p"
                 
                 if q_val and not any(q['url'] == v_url for q in qualities):
