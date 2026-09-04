@@ -54,11 +54,7 @@ def get_clean_headers(request: Request):
 async def explore(q: str = "brazzers", page: int = 1):
     try:
         target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}&o=mv"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36", 
-            "Cookie": "accessAgeDisclaimerPH=1; platform=pc;",
-            "Referer": "https://www.pornhub.com/"
-        }
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"}
         
         try:
             r = await http_client.get(target_url, headers=headers)
@@ -67,56 +63,53 @@ async def explore(q: str = "brazzers", page: int = 1):
             return JSONResponse([])
 
         videos = []
-        matches = list(re.finditer(r'viewkey=([a-z0-9]+)', html, re.I))
-        seen_vkeys = set()
+        blocks = re.split(r'data-video-vkey="', html, flags=re.I)
         
-        for m in matches:
-            vkey = m.group(1)
-            if vkey in seen_vkeys or len(vkey) < 5:
-                continue
-            seen_vkeys.add(vkey)
-            
-            start = max(0, m.start() - 500)
-            end = min(len(html), m.end() + 1500)
-            block = html[start:end]
-            
-            title_match = re.search(r'(?:title|alt)\s*=\s*"([^"]+)"', block, re.I)
-            if not title_match:
-                title_match = re.search(r'class="title"[^>]*>.*?<a[^>]*>([^<]+)</a>', block, re.I | re.DOTALL)
-            title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip() if title_match else f"Video {vkey}"
-            
-            thumb_match = re.search(r'data-(?:mediabook|thumb_url|mediumthumb|thumb|image|src)\s*=\s*"([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
-            if not thumb_match:
-                thumb_match = re.search(r'src\s*=\s*"([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
-            
-            thumb = thumb_match.group(1) if thumb_match else ""
-            thumb = thumb.replace("&amp;", "&")
-            if thumb.startswith('//'): 
-                thumb = 'https:' + thumb
-            
-            if not thumb or not thumb.startswith('http') or any(x in thumb for x in ['data:image', 'pixel', 'transparent', 'blank', 'spinner', 'l.gif']):
-                thumb = ""
+        for block in blocks[1:]:
+            try:
+                block = block[:2500]
+                vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
+                title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
+                
+                thumb_match = re.search(r'data-(?:thumb_url|mediabook|image)="([^"]+)"', block, re.I)
+                if not thumb_match:
+                    thumb_match = re.search(r'src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
+                
+                dur_match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.I)
+                date_match = re.search(r'<var class="added">([^<]+)<\/var>', block, re.I)
+                upload_date = date_match.group(1).strip() if date_match else ""
 
-            dur_match = re.search(r'<(?:var|span)\s+class="duration"[^>]*>([^<]+)</(?:var|span)>', block, re.I)
-            dur = dur_match.group(1).strip() if dur_match else "HD"
+                if vkey_match and title_match and thumb_match:
+                    vkey = vkey_match.group(1)
+                    title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip()
+                    thumb = thumb_match.group(1)
+                    
+                    if thumb.startswith('//'): 
+                        thumb = 'https:' + thumb
+                    
+                    if not thumb.startswith('http') or 'data:image' in thumb or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
+                        continue
 
-            date_match = re.search(r'<(?:var|span)\s+class="added"[^>]*>([^<]+)</(?:var|span)>', block, re.I)
-            upload_date = date_match.group(1).strip() if date_match else ""
-            
-            is_ad = re.search(r'\b(sponsor|promo|banner|signup|premium ads)\b', title, re.I)
-            
-            if not is_ad:
-                videos.append({
-                    "vkey": vkey, 
-                    "title": title, 
-                    "thumbnail": thumb, 
-                    "duration": dur,
-                    "date": upload_date,
-                    "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}", 
-                    "provider": "pornhub"
-                })
-            if len(videos) >= 48: 
-                break
+                    dur = "HD"
+                    if dur_match:
+                        raw_dur = dur_match.group(1) or dur_match.group(2)
+                        if raw_dur: dur = raw_dur.strip()
+                    
+                    is_ad = re.search(r'\b(sponsor|promo|banner|signup|premium ads)\b', title, re.I)
+                    
+                    if not is_ad and not any(v['vkey'] == vkey for v in videos):
+                        videos.append({
+                            "vkey": vkey, 
+                            "title": title, 
+                            "thumbnail": thumb, 
+                            "duration": dur,
+                            "date": upload_date,
+                            "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}", 
+                            "provider": "pornhub"
+                        })
+                if len(videos) >= 48: break
+            except Exception:
+                continue 
         
         return JSONResponse(videos)
     except Exception as e:
@@ -197,6 +190,7 @@ async def extract(url: str):
                 except:
                     pass
 
+        # HLS Fallback (Strictly named Source if Auto would be used)
         if not qualities:
             clean_html = html.replace('\\/', '/')
             m3u8_links = set(re.findall(r'(https?:\/\/[^"\'\s]+\.m3u8(?:[^\'"]*))', clean_html))
@@ -205,6 +199,7 @@ async def extract(url: str):
                     if not any(q['url'] == link for q in qualities):
                         qualities.append({"quality": "Source", "url": link})
 
+        # Ensure qualities are sorted highest to lowest if possible
         def get_res(q):
             num = re.sub(r'\D', '', q['quality'])
             return int(num) if num else 0
@@ -238,24 +233,13 @@ async def proxy_video(url: str, request: Request):
 
 @app.api_route("/proxy-image", methods=["GET"])
 async def proxy_image(url: str, request: Request):
-    if not url:
-        return Response(status_code=400)
-    target_url = unquote(url)
     req_headers = get_clean_headers(request)
-    req_headers["Referer"] = "https://www.pornhub.com/"
-    req_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    req = http_client.build_request("GET", unquote(url), headers=req_headers)
     try:
-        req = http_client.build_request("GET", target_url, headers=req_headers)
         r = await http_client.send(req, stream=True)
-        if r.status_code != 200:
-            return Response(status_code=r.status_code)
-        resp_headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Content-Type": r.headers.get("Content-Type", "image/jpeg"),
-            "Cache-Control": "public, max-age=86400"
-        }
+        resp_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": r.headers.get("Content-Type", "image/jpeg")}
         return StreamingResponse(r.aiter_raw(), status_code=r.status_code, headers=resp_headers, background=r.aclose)
-    except Exception:
+    except:
         return Response(status_code=404)
 
 @app.api_route("/proxy-m3u8", methods=["GET"])
