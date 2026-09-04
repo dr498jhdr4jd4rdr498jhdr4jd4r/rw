@@ -18,7 +18,7 @@ class PornhubScraper:
     def __init__(self):
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
             'Referer': 'https://www.pornhub.com/',
             'Cookie': 'accessAgeDisclaimerPH=1; age_verified=1; platform=pc; hasVisited=1; cookiesBanner=1;'
@@ -46,7 +46,7 @@ class PornhubScraper:
                 try:
                     p = self.proxies if use_proxy and (self.proxies.get("http") or self.proxies.get("https")) else None
                     resp = requests.get(target, headers=headers, proxies=p, timeout=15, allow_redirects=True)
-                    if resp.status_code == 200 and len(resp.text) > 1000:
+                    if resp.status_code == 200 and len(resp.text) > 1000 and "cloudflare" not in resp.text.lower():
                         return resp
                 except Exception:
                     continue
@@ -284,7 +284,6 @@ def fetch_videos_from_page(q: str, page_num: int):
 def explore(q: str = "brazzers", page: int = 1):
     try:
         videos = fetch_videos_from_page(q, page)
-        
         if len(videos) < 20 and page == 1:
             videos_page_2 = fetch_videos_from_page(q, 2)
             existing_vkeys = {v['vkey'] for v in videos}
@@ -292,7 +291,6 @@ def explore(q: str = "brazzers", page: int = 1):
                 if v['vkey'] not in existing_vkeys:
                     videos.append(v)
                     existing_vkeys.add(v['vkey'])
-        
         return JSONResponse(videos[:44])
     except Exception as e:
         logger.error(f"Explore error: {e}")
