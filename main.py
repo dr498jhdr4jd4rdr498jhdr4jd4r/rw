@@ -86,18 +86,16 @@ class PornhubScraper:
                     if line_clean.startswith("#EXT-X-STREAM-INF:"):
                         res_match = re.search(r"RESOLUTION=(\d+x\d+)", line_clean)
                         height = res_match.group(1).split("x")[1] if res_match and "x" in res_match.group(1) else "0"
-                        quality_label = f"{height}p" if height.isdigit() and int(height) > 0 else "Adaptive Auto"
-
-                        if i + 1 < len(lines) and not lines[i + 1].strip().startswith("#"):
-                            stream_uri = lines[i + 1].strip()
-                            stream_url = stream_uri if stream_uri.startswith('http') else urljoin(base_url, stream_uri)
-                            qualities.append({"quality": quality_label, "url": stream_url})
+                        if height.isdigit() and int(height) > 0:
+                            quality_label = f"{height}p"
+                            if i + 1 < len(lines) and not lines[i + 1].strip().startswith("#"):
+                                stream_uri = lines[i + 1].strip()
+                                stream_url = stream_uri if stream_uri.startswith('http') else urljoin(base_url, stream_uri)
+                                qualities.append({"quality": quality_label, "url": stream_url, "type": "hls"})
         except Exception:
             pass
 
         qualities.sort(key=lambda x: int(re.search(r'(\d+)', x['quality']).group(1)) if re.search(r'(\d+)', x['quality']) else 0, reverse=True)
-        if not qualities:
-            qualities.append({"quality": "HLS Master", "url": master_m3u8_url})
         return qualities
 
     def extract(self, url):
@@ -125,8 +123,11 @@ class PornhubScraper:
                 return {"status": "error", "error": "Failed to fetch source page", "url": url}
 
             page_text = resp.text
-            fv_match = re.search(r'var\s+flashvars_\d+\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
-                       re.search(r'flashvars(?:_\d+)?\s*=\s*(\{.*?\});', page_text, re.DOTALL)
+            
+            fv_match = re.search(r'(?:var\s+)?flashvars_\d+\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
+                       re.search(r'(?:var\s+)?flashvars\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
+                       re.search(r'playerObjList\s*=\s*(\{.*?\});', page_text, re.DOTALL)
+            
             if fv_match:
                 try:
                     data = json.loads(fv_match.group(1))
@@ -161,7 +162,7 @@ class PornhubScraper:
         if clean_thumbs and not poster:
             poster = clean_thumbs[0]
 
-        stream_data = {"direct_mp4": {}, "qualities": []}
+        stream_data = {"qualities": []}
         seen_q = set()
 
         for m in media_defs:
@@ -172,21 +173,24 @@ class PornhubScraper:
                 continue
 
             fmt = m.get('format', '').lower()
-            qual_raw = m.get('quality')
-            qual = str(qual_raw[0]) if isinstance(qual_raw, list) and qual_raw else str(qual_raw or "auto")
-            if qual == "[]" or not qual:
-                qual = "auto"
-
-            if fmt == 'mp4' or ('.mp4' in v_url and 'm3u8' not in v_url):
-                q_label = f"{qual}p" if qual.isdigit() else qual.upper()
-                stream_data["direct_mp4"][q_label] = v_url
-
             if fmt == 'hls' or '.m3u8' in v_url:
                 parsed_streams = self.parse_hls_qualities(v_url, referer=standard_url)
                 for pq in parsed_streams:
                     if pq["quality"] not in seen_q:
                         seen_q.add(pq["quality"])
                         stream_data["qualities"].append(pq)
+
+        if not stream_data["qualities"]:
+            m3u8_links = re.findall(r'(https?://[^"\'\s<>]+\.m3u8[^"\'\s<>]*)', page_text)
+            for link in m3u8_links:
+                parsed_streams = self.parse_hls_qualities(link.replace(r'\/', '/'), referer=standard_url)
+                for pq in parsed_streams:
+                    if pq["quality"] not in seen_q:
+                        seen_q.add(pq["quality"])
+                        stream_data["qualities"].append(pq)
+
+        if not stream_data["qualities"]:
+            return {"status": "error", "error": "Video streams could not be extracted from page.", "url": url}
 
         return {
             "status": "success",
@@ -236,7 +240,7 @@ def explore(q: str = "brazzers", page: int = 1):
             if not vkey:
                 continue
 
-            title_elem = item.xpath('.//span[@class="title"]//a/text() | .//span[contains(@class, "title")]//a/text() | .//a[contains(@class, "title")]/text()')
+            title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text()')
             if not title_elem:
                 title_elem = item.xpath('.//img/@alt')
             title = title_elem[0].strip() if title_elem else "Unknown Video"
@@ -251,24 +255,10 @@ def explore(q: str = "brazzers", page: int = 1):
                 continue
             thumb = clean_thumbs[0]
 
-            dur_elem = item.xpath('.//var[@class="duration"]/text() | .//span[@class="duration"]/text()')
-            duration = dur_elem[0].strip() if dur_elem else "HD"
-
-            # FIXED DATE SCRAPER: Safely parse active label, fallback text, or omit if bugged
-            date_elem = item.xpath('.//var[@class="added"]/text() | .//span[@class="added"]/text() | .//*[contains(@class, "added")]/text()')
-            date = ""
-            if date_elem:
-                raw_date = date_elem[0].strip()
-                # Prevent invalid epoch or corrupted year math printing "56 years ago"
-                if "56 years" not in raw_date and len(raw_date) < 30:
-                    date = raw_date
-
             videos.append({
                 "vkey": vkey,
                 "title": title,
                 "thumbnail": thumb,
-                "duration": duration,
-                "date": date,
                 "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
                 "provider": "pornhub"
             })
