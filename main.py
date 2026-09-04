@@ -71,24 +71,34 @@ async def explore(q: str = "brazzers", page: int = 1):
                 vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
                 title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
 
-                thumb_match = re.search(r'data-(?:thumb_url|mediabook|image)="([^"]+)"', block, re.I)
-                if not thumb_match:
-                    thumb_match = re.search(r'src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
+                # FIX: Strictly target real image URLs avoiding lazy-load base64 placeholders
+                thumb = ""
+                img_match = re.search(r'data-image=["\']([^"\']+)["\']', block, re.I)
+                if not img_match:
+                    img_match = re.search(r'data-thumb_url=["\']([^"\']+)["\']', block, re.I)
+                if not img_match:
+                    src_match = re.search(r'src=["\']([^"\']+)["\']', block, re.I)
+                    if src_match and not src_match.group(1).startswith("data:"):
+                        img_match = src_match
+                
+                if img_match:
+                    thumb = img_match.group(1).replace("\\/", "/")
+                
+                # Check for validity
+                if not thumb or 'data:image' in thumb or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
+                    continue
+                if thumb.startswith('//'): 
+                    thumb = 'https:' + thumb
+                if not thumb.startswith('http'):
+                    continue
 
                 dur_match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.I)
                 date_match = re.search(r'<var class="added">([^<]+)<\/var>', block, re.I)
                 upload_date = date_match.group(1).strip() if date_match else ""
 
-                if vkey_match and title_match and thumb_match:
+                if vkey_match and title_match:
                     vkey = vkey_match.group(1)
                     title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip()
-                    thumb = thumb_match.group(1).replace("\\/", "/") # Clean escaped slashes
-
-                    if thumb.startswith('//'): 
-                        thumb = 'https:' + thumb
-
-                    if not thumb.startswith('http') or 'data:image' in thumb or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
-                        continue
 
                     dur = "HD"
                     if dur_match:
@@ -123,16 +133,11 @@ async def extract(url: str):
 
         vkey_match = re.search(r'viewkey=([a-z0-9]+)', url, re.I)
         if not vkey_match:
-            alt_match = re.search(r'embed/([a-z0-9]+)', url, re.I)
-            if alt_match:
-                vkey = alt_match.group(1)
-            else:
-                return JSONResponse({"status": "error", "error": "Invalid or unsupported link format."})
-        else:
-            vkey = vkey_match.group(1)
+            return JSONResponse({"status": "error", "error": "Invalid or unsupported link format."})
+        vkey = vkey_match.group(1)
 
         target_url = f"https://www.pornhub.com/view_video.php?viewkey={vkey}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;", "Referer": "https://www.pornhub.com/"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"}
 
         try:
             r = await http_client.get(target_url, headers=headers)
@@ -140,11 +145,8 @@ async def extract(url: str):
         except Exception as e:
             return JSONResponse({"status": "error", "error": f"Upstream connection failed: {str(e)}"})
 
-        title = "Unknown Title"
-        poster = ""
-        media_defs = []
+        title, poster, media_defs = "Unknown Title", "", []
 
-        # Find FlashVars OR PlayerObjList
         fv_match = re.search(r'flashvars_\d+\s*=\s*(\{.*?\});', html, re.DOTALL) or re.search(r'flashvars\s*=\s*(\{.*?\});', html, re.DOTALL) or re.search(r'var\s+playerObjList\s*=\s*(\{.*?\});', html, re.DOTALL)
         if fv_match:
             try:
@@ -162,13 +164,25 @@ async def extract(url: str):
 
         qualities = []
 
+        # FIX: Robust quality scraper for both MP4 and HLS variants
         for m in media_defs:
             if not isinstance(m, dict): continue
             v_url = m.get("videoUrl") or m.get("url")
             if not v_url: continue
+            fmt = str(m.get("format", "")).lower()
 
-            fmt = m.get("format", "")
-            if fmt == "hls" or ".m3u8" in v_url:
+            if fmt == "mp4":
+                q_val = m.get("quality")
+                if isinstance(q_val, list) and len(q_val) > 0: q_val = str(q_val[0])
+                elif q_val: q_val = str(q_val)
+                else: q_val = ""
+                
+                if q_val.isdigit(): q_val += "p"
+                
+                if q_val and not any(q['url'] == v_url for q in qualities):
+                    qualities.append({"quality": q_val, "url": v_url, "type": "mp4"})
+
+            elif fmt == "hls" or ".m3u8" in v_url:
                 try:
                     m3_r = await http_client.get(v_url, headers=headers)
                     if m3_r.status_code == 200:
@@ -177,28 +191,29 @@ async def extract(url: str):
                         for i, line in enumerate(lines):
                             line = line.strip()
                             if line.startswith("#EXT-X-STREAM-INF:"):
+                                name_match = re.search(r'NAME=["\']([^"\']+)["\']', line)
                                 res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
-                                height = "0"
-                                if res_match and res_match.group(1) and 'x' in res_match.group(1):
+                                lbl = ""
+                                if name_match:
+                                    lbl = name_match.group(1)
+                                elif res_match:
                                     parts = res_match.group(1).split('x')
-                                    if len(parts) > 1: height = parts[1]
-                                lbl = f"{height}p" if height.isdigit() and int(height)>0 else ""
+                                    if len(parts) > 1: lbl = f"{parts[1]}p"
+                                
                                 if lbl and i+1 < len(lines) and not lines[i+1].startswith("#"):
                                     uri = lines[i+1].strip()
                                     abs_uri = uri if uri.startswith("http") else urljoin(base_url, uri)
                                     if not any(q['url'] == abs_uri for q in qualities):
-                                        qualities.append({"quality": lbl, "url": abs_uri})
-                except:
-                    pass
+                                        qualities.append({"quality": lbl, "url": abs_uri, "type": "hls"})
+                except: pass
 
-        # HLS Fallback
         if not qualities:
             clean_html = html.replace('\\/', '/')
             m3u8_links = set(re.findall(r'(https?:\/\/[^"\'\s]+\.m3u8(?:[^\'"]*))', clean_html))
             for link in m3u8_links:
                 if "master.m3u8" in link or "index.m3u8" in link:
                     if not any(q['url'] == link for q in qualities):
-                        qualities.append({"quality": "Source", "url": link})
+                        qualities.append({"quality": "Source", "url": link, "type": "hls"})
 
         def get_res(q):
             num = re.sub(r'\D', '', q['quality'])
@@ -217,21 +232,6 @@ async def extract(url: str):
     except Exception as e:
         return JSONResponse({"status": "error", "error": f"Internal API Error: {str(e)}"})
 
-# (Optional Debug/Fallback methods for accessing Railway directly. Unused by Cloudflare Worker)
-@app.api_route("/proxy-video", methods=["GET", "OPTIONS", "HEAD"])
-async def proxy_video(url: str, request: Request):
-    if request.method == "OPTIONS": return Response(status_code=204)
-    req_headers = get_clean_headers(request)
-    req = http_client.build_request(request.method, unquote(url), headers=req_headers)
-    try:
-        r = await http_client.send(req, stream=True)
-        resp_headers = {"Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges"}
-        for h in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Content-Encoding"]:
-            if h in r.headers: resp_headers[h] = r.headers[h]
-        return StreamingResponse(r.aiter_raw(), status_code=r.status_code, headers=resp_headers, background=r.aclose)
-    except Exception as e:
-        return Response(f"502 Error: {str(e)}", status_code=502)
-
 @app.get("/")
 def read_root():
-    return {"status": "Proxy API Online", "gateway": "Railway Backend (JSON Extractor)"}
+    return {"status": "Proxy API Online"}
