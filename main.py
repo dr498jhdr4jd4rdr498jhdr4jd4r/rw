@@ -26,6 +26,8 @@ class PornhubScraper:
             "http": os.getenv("HTTP_PROXY", ""),
             "https": os.getenv("HTTPS_PROXY", "")
         }
+        # Connection limits to avoid thread pool exhaustion on high concurrency
+        self.timeout = (3.0, 8.0) 
 
     def _fetch_page(self, url, referer=None):
         headers = self.headers.copy()
@@ -36,17 +38,18 @@ class PornhubScraper:
             parsed = urlparse(url)
             headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
 
-        for _ in range(2):
+        for attempt in range(3):
             try:
-                resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-                if resp.status_code == 200:
+                # Fast timeout limits threads from blocking the whole server
+                resp = requests.get(url, headers=headers, timeout=self.timeout, allow_redirects=True)
+                if resp.status_code == 200 and len(resp.text) > 1000:
                     return resp
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Fetch attempt {attempt + 1} failed for {url}: {e}")
 
         if self.proxies.get("http") or self.proxies.get("https"):
             try:
-                return requests.get(url, headers=headers, proxies=self.proxies, timeout=20, allow_redirects=True)
+                return requests.get(url, headers=headers, proxies=self.proxies, timeout=(4.0, 10.0), allow_redirects=True)
             except Exception:
                 pass
         return None
@@ -145,19 +148,22 @@ class PornhubScraper:
         try:
             resp = self._fetch_page(standard_url, referer="https://www.pornhub.com/")
             if not resp or resp.status_code != 200:
-                return {"status": "error", "error": "Failed to fetch source page", "url": url}
+                return {"status": "error", "error": "Failed to fetch source page from provider", "url": url}
 
             page_text = resp.text
             
+            # Multi-pattern fallback for capturing media definitions reliably
             fv_match = re.search(r'(?:var\s+)?flashvars_\d+\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
                        re.search(r'(?:var\s+)?flashvars\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
-                       re.search(r'playerObjList\s*=\s*(\{.*?\});', page_text, re.DOTALL)
+                       re.search(r'playerObjList\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
+                       re.search(r'var\s+playerConfig\s*=\s*(\{.*?\});', page_text, re.DOTALL)
             
             if fv_match:
                 try:
-                    data = json.loads(fv_match.group(1))
+                    cleaned_json_str = fv_match.group(1)
+                    data = json.loads(cleaned_json_str)
                     media_defs = data.get('mediaDefinitions', [])
-                    title = data.get('video_title') or title
+                    title = data.get('video_title') or data.get('videoTitle') or title
                     poster = data.get('image_url') or data.get('thumb_url') or poster
 
                     if poster:
@@ -165,8 +171,8 @@ class PornhubScraper:
                     for _, v in data.items():
                         if isinstance(v, str) and v.startswith('http') and any(ext in v.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
                             raw_thumbs.add(v)
-                except Exception:
-                    pass
+                except Exception as je:
+                    logger.warning(f"JSON parsing error on flashvars: {je}")
 
             if not media_defs:
                 md_match = re.search(r'"mediaDefinitions"\s*:\s*(\[\{.*?\}\])', page_text, re.DOTALL)
@@ -176,7 +182,7 @@ class PornhubScraper:
                     except Exception:
                         pass
         except Exception as e:
-            return {"status": "error", "error": str(e), "url": url}
+            return {"status": "error", "error": f"Extraction exception: {str(e)}", "url": url}
 
         if title == "Pornhub Video":
             og_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', page_text, re.I)
@@ -215,9 +221,8 @@ class PornhubScraper:
                         seen_q.add(pq["quality"])
                         stream_data["qualities"].append(pq)
 
-        # Ensure all high qualities are thoroughly collected before returning
-        if not stream_data["qualities"] or len(stream_data["qualities"]) < 2:
-            return {"status": "error", "error": "Incomplete or missing video qualities extracted.", "url": url}
+        if not stream_data["qualities"]:
+            return {"status": "error", "error": "Video streams could not be mapped or found. Video might be restricted.", "url": url}
 
         return {
             "status": "success",
@@ -244,6 +249,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Standard synchronous endpoints are fully handled in ThreadPool by FastAPI.
+# Limiting `timeout` in requests inside Scraper object prevents these threads from being exhausted.
 @app.get("/api/explore")
 def explore(q: str = "brazzers", page: int = 1):
     try:
@@ -280,6 +287,7 @@ def explore(q: str = "brazzers", page: int = 1):
                     "provider": "pornhub"
                 })
 
+        # Smart fallback if strict match provides insufficient results
         if len(videos) < 20:
             for item in items:
                 vkey = item.get("data-video-vkey") or (item.xpath('.//@data-video-vkey') or [None])[0]
@@ -337,4 +345,4 @@ def fallback_proxy_image(url: str):
 
 @app.get("/")
 def health():
-    return {"status": "Online", "engine": "Pornhub Dedicated Core"}
+    return {"status": "Online", "engine": "Pornhub Dedicated Core (Concurrent Secured)"}
