@@ -31,7 +31,7 @@ app.add_middleware(
 )
 
 def extract_with_ytdlp(url: str) -> dict:
-    """Blocking yt-dlp extraction logic to be run in a thread pool."""
+    """Blocking yt-dlp extraction logic to be run in a thread pool. STRICTLY HLS."""
     if url in extraction_cache:
         return extraction_cache[url]
 
@@ -58,7 +58,7 @@ def extract_with_ytdlp(url: str) -> dict:
         qualities = []
         seen_qualities = set()
 
-        # Parse HLS and MP4 formats
+        # Parse strictly HLS formats
         for f in info.get('formats', []):
             height = f.get('height')
             if not height:
@@ -66,11 +66,11 @@ def extract_with_ytdlp(url: str) -> dict:
             
             q_label = f"{height}p"
             f_url = f.get('url', '')
-            ext = f.get('ext', '')
             protocol = f.get('protocol', '')
+            ext = f.get('ext', '')
 
-            # Filter for video streams
-            if ext not in ['mp4', 'm3u8'] and 'm3u8' not in protocol:
+            # STRICT FILTER: Only allow m3u8 / HLS streams
+            if 'm3u8' not in protocol and ext != 'm3u8':
                 continue
 
             if q_label not in seen_qualities:
@@ -78,14 +78,14 @@ def extract_with_ytdlp(url: str) -> dict:
                 qualities.append({
                     "quality": q_label,
                     "url": f_url,
-                    "type": "hls" if ('m3u8' in protocol or ext == 'm3u8') else "mp4"
+                    "type": "hls"
                 })
 
         # Sort qualities highest to lowest
         qualities.sort(key=lambda x: int(x['quality'].replace('p', '')), reverse=True)
 
         if not qualities:
-            return {"status": "error", "error": "No valid streams found", "url": url}
+            return {"status": "error", "error": "No valid HLS streams found", "url": url}
 
         result = {
             "status": "success",
@@ -199,4 +199,4 @@ async def fallback_proxy_image(url: str):
 
 @app.get("/")
 def health():
-    return {"status": "Online", "engine": "yt-dlp Core", "concurrency": "async-threadpool"}
+    return {"status": "Online", "engine": "yt-dlp Core (Strict HLS)", "concurrency": "async-threadpool"}
