@@ -5,13 +5,7 @@ import json
 import httpx
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-
-FORBIDDEN_HEADERS = {
-    "host", "connection", "content-length", "cf-ray", "cf-connecting-ip", 
-    "cf-ipcountry", "cf-visitor", "cf-worker", "cdn-loop", "x-forwarded-for", 
-    "x-forwarded-proto", "x-forwarded-host", "x-real-ip"
-}
+from fastapi.responses import JSONResponse
 
 http_client: httpx.AsyncClient = None
 
@@ -20,8 +14,8 @@ async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(
         follow_redirects=True,
-        timeout=httpx.Timeout(45.0, connect=15.0),
-        limits=httpx.Limits(max_connections=200, max_keepalive_connections=50)
+        timeout=httpx.Timeout(20.0, connect=10.0),
+        limits=httpx.Limits(max_connections=300, max_keepalive_connections=100)
     )
     yield
     await http_client.aclose()
@@ -35,47 +29,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_clean_headers(request: Request):
-    req_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36", 
-        "Accept-Language": "en-US,en;q=0.9", 
-        "Referer": "https://www.pornhub.com/",
-        "Origin": "https://www.pornhub.com"
-    }
-    for k, v in request.headers.items():
-        if k.lower() not in FORBIDDEN_HEADERS:
-            req_headers[k] = v
-    cookie = req_headers.get("cookie", "")
-    if "accessAgeDisclaimerPH=1" not in cookie:
-        req_headers["cookie"] = (cookie + "; accessAgeDisclaimerPH=1; platform=pc;").strip("; ")
-    return req_headers
+PH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.pornhub.com/",
+    "Origin": "https://www.pornhub.com",
+    "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"
+}
 
 @app.get("/api/explore")
 async def explore(q: str = "brazzers", page: int = 1):
     try:
         target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}&o=mv"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;", "Referer": "https://www.pornhub.com/"}
-
-        try:
-            r = await http_client.get(target_url, headers=headers)
-            html = r.text
-        except Exception:
+        r = await http_client.get(target_url, headers=PH_HEADERS)
+        if r.status_code != 200:
             return JSONResponse([])
 
+        html = r.text
         videos = []
         blocks = re.split(r'data-video-vkey="', html, flags=re.I)
 
         for block in blocks[1:]:
             try:
-                block = block[:3000]
+                block = block[:3500]
                 vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
                 title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
 
-                thumb_match = re.search(r'data-(?:thumb_url|mediabook|image)="([^"]+)"', block, re.I)
-                if not thumb_match:
-                    thumb_match = re.search(r'src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
-                if not thumb_match:
-                    thumb_match = re.search(r'data-src="([^"]+)"', block, re.I)
+                # Prioritized check for raw thumbnail paths (avoiding blank.gif/pixel.gif)
+                thumb_match = (
+                    re.search(r'data-thumb_url="([^"]+)"', block, re.I) or
+                    re.search(r'data-mediumthumb="([^"]+)"', block, re.I) or
+                    re.search(r'data-image="([^"]+)"', block, re.I) or
+                    re.search(r'data-src="([^"]+)"', block, re.I) or
+                    re.search(r'src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
+                )
 
                 dur_match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.I)
                 date_match = re.search(r'<var class="added">([^<]+)<\/var>', block, re.I)
@@ -84,233 +71,163 @@ async def explore(q: str = "brazzers", page: int = 1):
                 if vkey_match and title_match and thumb_match:
                     vkey = vkey_match.group(1)
                     title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip()
-                    thumb = thumb_match.group(1).strip()
+                    thumb = thumb_match.group(1).replace("&amp;", "&").strip()
 
-                    if thumb.startswith('//'): 
+                    if thumb.startswith('//'):
                         thumb = 'https:' + thumb
                     elif thumb.startswith('/'):
                         thumb = 'https://www.pornhub.com' + thumb
 
-                    if not thumb.startswith('http') or 'data:image' in thumb or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
+                    # Discard 1x1 tracking pixels
+                    if 'data:image' in thumb or 'blank.gif' in thumb or 'pixel' in thumb or not thumb.startswith('http'):
                         continue
 
                     dur = "HD"
                     if dur_match:
                         raw_dur = dur_match.group(1) or dur_match.group(2)
-                        if raw_dur: dur = raw_dur.strip()
+                        if raw_dur:
+                            dur = raw_dur.strip()
 
                     is_ad = re.search(r'\b(sponsor|promo|banner|signup|premium ads)\b', title, re.I)
 
                     if not is_ad and not any(v['vkey'] == vkey for v in videos):
                         videos.append({
-                            "vkey": vkey, 
-                            "title": title, 
-                            "thumbnail": thumb, 
+                            "vkey": vkey,
+                            "title": title,
+                            "thumbnail": thumb,
                             "duration": dur,
                             "date": upload_date,
-                            "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}", 
+                            "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
                             "provider": "pornhub"
                         })
-                if len(videos) >= 48: break
+
+                if len(videos) >= 44:
+                    break
             except Exception:
-                continue 
+                continue
 
         return JSONResponse(videos)
-    except Exception as e:
+    except Exception:
         return JSONResponse([])
 
 @app.get("/api/extract")
 async def extract(url: str):
     try:
         if not url:
-            return JSONResponse({"status": "error", "error": "URL parameter is missing"})
+            return JSONResponse({"status": "error", "error": "Missing URL parameter"})
 
-        vkey_match = re.search(r'viewkey=([a-z0-9]+)', url, re.I)
+        vkey_match = re.search(r'viewkey=([a-z0-9]+)', url, re.I) or re.search(r'embed/([a-z0-9]+)', url, re.I)
         if not vkey_match:
-            alt_match = re.search(r'embed/([a-z0-9]+)', url, re.I)
-            if alt_match:
-                vkey = alt_match.group(1)
-            else:
-                return JSONResponse({"status": "error", "error": "Invalid or unsupported Pornhub link format."})
-        else:
-            vkey = vkey_match.group(1)
+            return JSONResponse({"status": "error", "error": "Invalid viewkey"})
 
+        vkey = vkey_match.group(1)
         target_url = f"https://www.pornhub.com/view_video.php?viewkey={vkey}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;", "Referer": "https://www.pornhub.com/"}
 
-        try:
-            r = await http_client.get(target_url, headers=headers)
-            html = r.text
-        except Exception as e:
-            return JSONResponse({"status": "error", "error": f"Upstream connection failed: {str(e)}"})
+        r = await http_client.get(target_url, headers=PH_HEADERS)
+        html = r.text
 
-        title = "Unknown Title"
+        title = "Pornhub Video"
         poster = ""
         media_defs = []
 
-        fv_match = re.search(r'flashvars_\d+\s*=\s*(\{.*?\});', html, re.DOTALL) or re.search(r'flashvars\s*=\s*(\{.*?\});', html, re.DOTALL) or re.search(r'var\s+playerObjList\s*=\s*(\{.*?\});', html, re.DOTALL)
+        fv_match = (
+            re.search(r'flashvars_\d+\s*=\s*(\{.*?\});', html, re.DOTALL) or
+            re.search(r'flashvars\s*=\s*(\{.*?\});', html, re.DOTALL) or
+            re.search(r'var\s+playerObjList\s*=\s*(\{.*?\});', html, re.DOTALL)
+        )
+
         if fv_match:
             try:
                 data = json.loads(fv_match.group(1))
                 media_defs = data.get("mediaDefinitions", [])
                 title = data.get("video_title", title)
                 poster = data.get("image_url") or data.get("thumb_url") or poster
-            except: pass
+            except Exception:
+                pass
 
         if not media_defs:
             md_match = re.search(r'"mediaDefinitions"\s*:\s*(\[\{.*?\}\])', html, re.DOTALL)
             if md_match:
-                try: media_defs = json.loads(md_match.group(1))
-                except: pass
+                try:
+                    media_defs = json.loads(md_match.group(1))
+                except Exception:
+                    pass
 
         qualities = []
+        seen_qualities = set()
 
+        # Parse HLS master playlists only once
         for m in media_defs:
-            if not isinstance(m, dict): continue
-            v_url = m.get("videoUrl") or m.get("url")
-            if not v_url: continue
+            if not isinstance(m, dict):
+                continue
 
-            direct_quality = m.get("quality") or m.get("height")
-            if direct_quality and str(direct_quality).isdigit():
-                lbl = f"{direct_quality}p"
-                if not any(q['url'] == v_url for q in qualities):
-                    qualities.append({"quality": lbl, "url": v_url})
+            v_url = m.get("videoUrl") or m.get("url")
+            if not v_url:
                 continue
 
             fmt = m.get("format", "")
             if fmt == "hls" or ".m3u8" in v_url:
                 try:
-                    m3_r = await http_client.get(v_url, headers=headers)
-                    if m3_r.status_code == 200:
+                    m3_r = await http_client.get(v_url, headers=PH_HEADERS)
+                    if m3_r.status_code == 200 and "#EXTM3U" in m3_r.text:
                         lines = m3_r.text.splitlines()
-                        base_url = v_url[:v_url.rfind('/')+1]
+                        base_url = v_url[:v_url.rfind('/') + 1]
+
                         for i, line in enumerate(lines):
                             line = line.strip()
                             if line.startswith("#EXT-X-STREAM-INF:"):
                                 res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
                                 height = "0"
-                                if res_match and res_match.group(1) and 'x' in res_match.group(1):
-                                    parts = res_match.group(1).split('x')
-                                    if len(parts) > 1: height = parts[1]
-                                
-                                lbl = f"{height}p" if height.isdigit() and int(height)>0 else ""
-                                
-                                if i+1 < len(lines) and not lines[i+1].startswith("#"):
-                                    uri = lines[i+1].strip()
-                                    abs_uri = uri if uri.startswith("http") else urljoin(base_url, uri)
-                                    
-                                    if not lbl or lbl == "0p":
-                                        if "1080" in abs_uri: lbl = "1080p"
-                                        elif "720" in abs_uri: lbl = "720p"
-                                        elif "480" in abs_uri: lbl = "480p"
-                                        elif "360" in abs_uri: lbl = "360p"
-                                        else: lbl = f"Stream {len(qualities)+1}"
+                                if res_match and 'x' in res_match.group(1):
+                                    height = res_match.group(1).split('x')[1]
 
-                                    if not any(q['url'] == abs_uri for q in qualities):
+                                lbl = f"{height}p" if height.isdigit() and int(height) > 0 else ""
+
+                                if i + 1 < len(lines) and not lines[i + 1].startswith("#"):
+                                    uri = lines[i + 1].strip()
+                                    abs_uri = uri if uri.startswith("http") else urljoin(base_url, uri)
+
+                                    if not lbl or lbl == "0p":
+                                        for res_guess in ["1080", "720", "480", "360", "240"]:
+                                            if res_guess in abs_uri:
+                                                lbl = f"{res_guess}p"
+                                                break
+                                        if not lbl:
+                                            lbl = f"Stream {len(qualities) + 1}"
+
+                                    if lbl not in seen_qualities:
+                                        seen_qualities.add(lbl)
                                         qualities.append({"quality": lbl, "url": abs_uri})
-                except:
+
+                        # Successfully parsed master playlist, stop duplicate network calls
+                        if qualities:
+                            break
+                except Exception:
                     pass
 
-        for m in media_defs:
-            if not isinstance(m, dict): continue
-            v_url = m.get("videoUrl") or m.get("url")
-            if v_url and ".mp4" in v_url and not any(q['url'] == v_url for q in qualities):
-                q_lbl = str(m.get("height") or m.get("quality") or "HD")
-                if not q_lbl.endswith("p") and q_lbl.isdigit(): q_lbl += "p"
-                qualities.append({"quality": q_lbl, "url": v_url})
+        # Sort highest resolution to lowest
+        def sort_key(q):
+            digits = re.sub(r'\D', '', q['quality'])
+            return int(digits) if digits else 0
 
-        def get_res(q):
-            num = re.sub(r'\D', '', q['quality'])
-            return int(num) if num else 0
-        qualities.sort(key=get_res, reverse=True)
+        qualities.sort(key=sort_key, reverse=True)
 
-        if not title or title == "Unknown Title":
+        if not title or title == "Pornhub Video":
             og = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, re.I)
-            if og: title = og.group(1).replace(" - Pornhub.com", "")
+            if og:
+                title = og.group(1).replace(" - Pornhub.com", "").strip()
 
         return JSONResponse({
-            "status": "success", "title": title.strip(), "thumbnail": poster,
-            "streams": {"qualities": qualities}, "url": target_url, "provider": "pornhub"
+            "status": "success",
+            "title": title,
+            "thumbnail": poster,
+            "streams": {"qualities": qualities},
+            "url": target_url,
+            "provider": "pornhub"
         })
     except Exception as e:
-        return JSONResponse({"status": "error", "error": f"Internal API Error: {str(e)}"})
-
-@app.api_route("/proxy-video", methods=["GET", "OPTIONS", "HEAD"])
-async def proxy_video(url: str, request: Request):
-    if request.method == "OPTIONS": return Response(status_code=204)
-    req_headers = get_clean_headers(request)
-    req = http_client.build_request(request.method, unquote(url), headers=req_headers)
-    try:
-        r = await http_client.send(req, stream=True)
-    except Exception as e:
-        return Response(f"502 Error: {str(e)}", status_code=502)
-
-    resp_headers = {"Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges"}
-    for h in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Content-Encoding"]:
-        if h in r.headers: resp_headers[h] = r.headers[h]
-    return StreamingResponse(r.aiter_raw(), status_code=r.status_code, headers=resp_headers, background=r.aclose)
-
-@app.api_route("/proxy-image", methods=["GET"])
-async def proxy_image(url: str, request: Request):
-    try:
-        target_img_url = unquote(url)
-        if not target_img_url.startswith('http'):
-            return Response(status_code=400)
-            
-        req_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://www.pornhub.com/",
-            "Origin": "https://www.pornhub.com"
-        }
-        
-        r = await http_client.get(target_img_url, headers=req_headers)
-        if r.status_code != 200:
-            return Response(status_code=404)
-
-        resp_headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Content-Type": r.headers.get("Content-Type", "image/jpeg"),
-            "Cache-Control": "public, max-age=86400"
-        }
-        return StreamingResponse(r.aiter_raw(), status_code=200, headers=resp_headers, background=r.aclose)
-    except Exception:
-        return Response(status_code=404)
-
-@app.api_route("/proxy-m3u8", methods=["GET"])
-async def proxy_m3u8(url: str, request: Request):
-    target = unquote(url)
-    req_headers = get_clean_headers(request)
-    r = await http_client.get(target, headers=req_headers)
-
-    if r.status_code != 200:
-        return Response(status_code=r.status_code)
-
-    base = target[:target.rfind('/')+1]
-    request_host = request.query_params.get("request_host")
-    cf_host = f"https://{request_host}" if request_host else f"{request.url.scheme}://{request.headers.get('host')}"
-
-    rewritten = []
-    for line in r.text.splitlines():
-        line = line.strip()
-        if not line: continue
-
-        if line.startswith("#EXT-X-MAP:") or line.startswith("#EXT-X-KEY:"):
-            def replacer(match):
-                uri = match.group(1)
-                abs_uri = uri if uri.startswith('http') else urljoin(base, uri)
-                return f'URI="{cf_host}/proxy-video?url={quote(abs_uri)}"'
-            rewritten.append(re.sub(r'URI="([^"]+)"', replacer, line))
-        elif line.startswith("#"):
-            rewritten.append(line)
-        else:
-            abs_uri = line if line.startswith('http') else urljoin(base, line)
-            if ".m3u8" in abs_uri:
-                rewritten.append(f"{cf_host}/proxy-m3u8?url={quote(abs_uri)}&request_host={quote(request_host or '')}")
-            else:
-                rewritten.append(f"{cf_host}/proxy-video?url={quote(abs_uri)}")
-
-    return Response("\n".join(rewritten), media_type="application/vnd.apple.mpegurl", headers={"Access-Control-Allow-Origin": "*"})
+        return JSONResponse({"status": "error", "error": f"Extraction failed: {str(e)}"})
 
 @app.get("/")
-def read_root():
-    return {"status": "Proxy Online", "gateway": "Railway-NL HLS Router"}
+def root():
+    return {"status": "VexoStream Backend Online", "engine": "FastAPI Railway"}
