@@ -2,10 +2,12 @@ import os
 import re
 import json
 import logging
+import time
+import asyncio
 from urllib.parse import urlparse, urljoin, quote, unquote
 from contextlib import asynccontextmanager
 
-import requests
+import httpx
 from lxml import html
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +16,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-class PornhubScraper:
+# --- Simple In-Memory Cache for High Concurrency ---
+CACHE_TTL = 300  # 5 minutes
+extraction_cache = {}
+search_cache = {}
+
+class AsyncPornhubScraper:
     def __init__(self):
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -22,12 +29,12 @@ class PornhubScraper:
             'Accept-Language': 'en-US,en;q=0.9',
             'Cookie': 'has_accepted_cookie=1; age_verified=1; platform=pc; accessAgeDisclaimerPH=1; accessAgeDisclaimer=1;'
         }
-        self.proxies = {
-            "http": os.getenv("HTTP_PROXY", ""),
-            "https": os.getenv("HTTPS_PROXY", "")
-        }
+        
+        # High concurrency limits for httpx
+        limits = httpx.Limits(max_keepalive_connections=200, max_connections=1000)
+        self.client = httpx.AsyncClient(limits=limits, timeout=20.0, follow_redirects=True)
 
-    def _fetch_page(self, url, referer=None):
+    async def _fetch_page(self, url, referer=None):
         headers = self.headers.copy()
         if referer:
             headers['Referer'] = referer
@@ -36,19 +43,12 @@ class PornhubScraper:
             parsed = urlparse(url)
             headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
 
-        for _ in range(2):
-            try:
-                resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
-                if resp.status_code == 200:
-                    return resp
-            except Exception:
-                pass
-
-        if self.proxies.get("http") or self.proxies.get("https"):
-            try:
-                return requests.get(url, headers=headers, proxies=self.proxies, timeout=20, allow_redirects=True)
-            except Exception:
-                pass
+        try:
+            resp = await self.client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp
+        except Exception as e:
+            logger.error(f"Fetch failed for {url}: {e}")
         return None
 
     def clean_thumbnails(self, thumbs, base_url="https://www.pornhub.com/"):
@@ -75,10 +75,10 @@ class PornhubScraper:
                     clean.append(t)
         return clean
 
-    def parse_hls_qualities(self, master_m3u8_url, referer=None):
+    async def parse_hls_qualities(self, master_m3u8_url, referer=None):
         qualities = []
         try:
-            resp = self._fetch_page(master_m3u8_url, referer)
+            resp = await self._fetch_page(master_m3u8_url, referer)
             if resp and resp.status_code == 200:
                 lines = resp.text.splitlines()
                 base_url = master_m3u8_url.rsplit('/', 1)[0] + '/'
@@ -106,24 +106,20 @@ class PornhubScraper:
         except Exception as e:
             logger.error(f"Error parsing master m3u8: {e}")
 
-        if not qualities:
-            try:
-                resp = self._fetch_page(master_m3u8_url, referer)
-                if resp:
-                    for line in resp.text.splitlines():
-                        if 'm3u8' in line and not line.startswith('#'):
-                            u = line.strip()
-                            full_u = u if u.startswith('http') else urljoin(master_m3u8_url, u)
-                            for q_val in ['1080p', '720p', '480p', '360p', '240p']:
-                                if q_val in full_u.lower() and not any(x['quality'] == q_val for x in qualities):
-                                    qualities.append({"quality": q_val, "url": full_u, "type": "hls"})
-            except Exception:
-                pass
+        # Fallback if parsing failed but m3u8 exists
+        if not qualities and resp and resp.status_code == 200:
+            for line in resp.text.splitlines():
+                if 'm3u8' in line and not line.startswith('#'):
+                    u = line.strip()
+                    full_u = u if u.startswith('http') else urljoin(master_m3u8_url, u)
+                    for q_val in ['1080p', '720p', '480p', '360p', '240p']:
+                        if q_val in full_u.lower() and not any(x['quality'] == q_val for x in qualities):
+                            qualities.append({"quality": q_val, "url": full_u, "type": "hls"})
 
         qualities.sort(key=lambda x: int(re.search(r'(\d+)', x['quality']).group(1)) if re.search(r'(\d+)', x['quality']) else 0, reverse=True)
         return qualities
 
-    def extract(self, url):
+    async def extract(self, url):
         viewkey = None
         if 'viewkey=' in url:
             viewkey = url.split('viewkey=')[1].split('&')[0]
@@ -140,15 +136,15 @@ class PornhubScraper:
         standard_url = f"https://www.pornhub.com/view_video.php?viewkey={viewkey}"
         title, poster, media_defs = "Pornhub Video", "", []
         raw_thumbs = set()
-        page_text = ""
 
         try:
-            resp = self._fetch_page(standard_url, referer="https://www.pornhub.com/")
+            resp = await self._fetch_page(standard_url, referer="https://www.pornhub.com/")
             if not resp or resp.status_code != 200:
                 return {"status": "error", "error": "Failed to fetch source page", "url": url}
 
             page_text = resp.text
             
+            # Robust extraction of flashvars
             fv_match = re.search(r'(?:var\s+)?flashvars_\d+\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
                        re.search(r'(?:var\s+)?flashvars\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
                        re.search(r'playerObjList\s*=\s*(\{.*?\});', page_text, re.DOTALL)
@@ -200,7 +196,7 @@ class PornhubScraper:
 
             fmt = m.get('format', '').lower()
             if fmt == 'hls' or '.m3u8' in v_url:
-                parsed_streams = self.parse_hls_qualities(v_url, referer=standard_url)
+                parsed_streams = await self.parse_hls_qualities(v_url, referer=standard_url)
                 for pq in parsed_streams:
                     if pq["quality"] not in seen_q:
                         seen_q.add(pq["quality"])
@@ -209,15 +205,14 @@ class PornhubScraper:
         if not stream_data["qualities"]:
             m3u8_links = re.findall(r'(https?://[^"\'\s<>]+\.m3u8[^"\'\s<>]*)', page_text)
             for link in m3u8_links:
-                parsed_streams = self.parse_hls_qualities(link.replace(r'\/', '/'), referer=standard_url)
+                parsed_streams = await self.parse_hls_qualities(link.replace(r'\/', '/'), referer=standard_url)
                 for pq in parsed_streams:
                     if pq["quality"] not in seen_q:
                         seen_q.add(pq["quality"])
                         stream_data["qualities"].append(pq)
 
-        # Ensure all high qualities are thoroughly collected before returning
-        if not stream_data["qualities"] or len(stream_data["qualities"]) < 2:
-            return {"status": "error", "error": "Incomplete or missing video qualities extracted.", "url": url}
+        if not stream_data["qualities"]:
+            return {"status": "error", "error": "Extraction failed. Video might be premium or Geo-Blocked.", "url": url}
 
         return {
             "status": "success",
@@ -229,11 +224,12 @@ class PornhubScraper:
             "provider": "pornhub"
         }
 
-scraper = PornhubScraper()
+scraper = AsyncPornhubScraper()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
+    await scraper.client.aclose()
 
 app = FastAPI(title="Pornhub Core Scraper", lifespan=lifespan)
 
@@ -245,10 +241,16 @@ app.add_middleware(
 )
 
 @app.get("/api/explore")
-def explore(q: str = "brazzers", page: int = 1):
+async def explore(q: str = "brazzers", page: int = 1):
+    cache_key = f"{q}_{page}"
+    now = time.time()
+    
+    if cache_key in search_cache and now - search_cache[cache_key]['time'] < CACHE_TTL:
+        return JSONResponse(search_cache[cache_key]['data'])
+
     try:
         search_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
-        resp = scraper._fetch_page(search_url, referer="https://www.pornhub.com/")
+        resp = await scraper._fetch_page(search_url, referer="https://www.pornhub.com/")
         if not resp or resp.status_code != 200:
             return JSONResponse([])
 
@@ -259,7 +261,7 @@ def explore(q: str = "brazzers", page: int = 1):
 
         for item in items:
             vkey = item.get("data-video-vkey") or (item.xpath('.//@data-video-vkey') or [None])[0]
-            if not vkey:
+            if not vkey or any(v["vkey"] == vkey for v in videos):
                 continue
 
             title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text() | .//img/@alt')
@@ -279,57 +281,52 @@ def explore(q: str = "brazzers", page: int = 1):
                     "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
                     "provider": "pornhub"
                 })
+            
+            if len(videos) >= 24:
+                break
 
-        if len(videos) < 20:
-            for item in items:
-                vkey = item.get("data-video-vkey") or (item.xpath('.//@data-video-vkey') or [None])[0]
-                if not vkey or any(v["vkey"] == vkey for v in videos):
-                    continue
-
-                title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text() | .//img/@alt')
-                title = title_elem[0].strip() if title_elem else "Unknown Video"
-
-                raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@data-src | .//img/@src')
-                clean_thumbs = scraper.clean_thumbnails(raw_thumbs, "https://www.pornhub.com/")
-                if not clean_thumbs:
-                    continue
-
-                videos.append({
-                    "vkey": vkey,
-                    "title": title,
-                    "thumbnail": clean_thumbs[0],
-                    "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
-                    "provider": "pornhub"
-                })
-
-                if len(videos) >= 20:
-                    break
-
-        return JSONResponse(videos[:24])
+        res_data = videos[:24]
+        search_cache[cache_key] = {'time': now, 'data': res_data}
+        return JSONResponse(res_data)
+        
     except Exception as e:
         logger.error(f"Explore error: {e}")
         return JSONResponse([])
 
 @app.get("/api/extract")
-def extract_endpoint(url: str):
+async def extract_endpoint(url: str):
     if not url:
         return JSONResponse({"status": "error", "error": "Missing URL"})
-    res = scraper.extract(unquote(url))
+    
+    clean_url = unquote(url)
+    now = time.time()
+    
+    # In-memory cache protects from massive concurrent requests to the same video
+    if clean_url in extraction_cache and now - extraction_cache[clean_url]['time'] < CACHE_TTL:
+        return JSONResponse(extraction_cache[clean_url]['data'])
+
+    res = await scraper.extract(clean_url)
+    
+    if res.get("status") == "success":
+        extraction_cache[clean_url] = {'time': now, 'data': res}
+        
     return JSONResponse(res)
 
 @app.get("/proxy-image")
-def fallback_proxy_image(url: str):
+async def fallback_proxy_image(url: str):
     target = unquote(url).strip()
     if target.startswith('//'):
         target = "https:" + target
     try:
-        req = requests.get(target, headers=scraper.headers, stream=True, timeout=15)
-        return StreamingResponse(
-            req.iter_content(chunk_size=8192),
+        # Use httpx async stream for proxying
+        req = await scraper.client.get(target, follow_redirects=True)
+        return Response(
+            content=req.content,
             status_code=req.status_code,
             headers={
                 "Content-Type": req.headers.get("Content-Type", "image/jpeg"),
-                "Access-Control-Allow-Origin": "*"
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "public, max-age=86400"
             }
         )
     except Exception:
@@ -337,4 +334,4 @@ def fallback_proxy_image(url: str):
 
 @app.get("/")
 def health():
-    return {"status": "Online", "engine": "Pornhub Dedicated Core"}
+    return {"status": "Online", "engine": "Pornhub Dedicated Core (Async)"}
