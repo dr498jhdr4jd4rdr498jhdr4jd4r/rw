@@ -70,6 +70,8 @@ async def explore(q: str = "brazzers", page: int = 1):
                 block = block[:1500]
                 vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
                 title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
+                
+                # Strict thumbnail matching
                 thumb_match = re.search(r'(?:data-thumb_url|data-mediabook|data-src|src)="([^"]+\.(?:jpg|jpeg|png|webp|gif)[^"]*)"', block, re.I)
                 dur_match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.I)
 
@@ -77,8 +79,14 @@ async def explore(q: str = "brazzers", page: int = 1):
                     vkey = vkey_match.group(1)
                     title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip()
                     thumb = thumb_match.group(1)
-                    if thumb.startswith('//'): thumb = 'https:' + thumb
                     
+                    if thumb.startswith('//'): 
+                        thumb = 'https:' + thumb
+                    
+                    # Core fix: Strict block against broken/empty thumbnails
+                    if not thumb.startswith('http') or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
+                        continue
+
                     dur = "HD"
                     if dur_match:
                         raw_dur = dur_match.group(1) or dur_match.group(2)
@@ -183,7 +191,7 @@ async def extract(url: str):
                 label = f"{clean_qual}p" if clean_qual.isdigit() else clean_qual.upper()
                 direct_mp4[label] = v_url
 
-        # Fallback مکانیزم پشتیبان برای اطمینان از عدم بروز خطای خالی ماندن کیفیت‌ها
+        # Core fix: Quality Selection Fallback Logic
         if not qualities:
             m3u8_links = re.findall(r'https?:\/\/[^"\']+\.m3u8(?:\?[^"\']*)?', html)
             for link in m3u8_links:
