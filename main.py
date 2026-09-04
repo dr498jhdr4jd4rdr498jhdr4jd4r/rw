@@ -71,14 +71,11 @@ async def explore(q: str = "brazzers", page: int = 1):
                 vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
                 title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
                 
-                # STRICT THUMBNAIL EXTRACTION: Prioritize real data-thumb attributes
                 thumb_match = re.search(r'data-(?:thumb_url|mediabook|image)="([^"]+)"', block, re.I)
                 if not thumb_match:
                     thumb_match = re.search(r'src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
                 
                 dur_match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.I)
-                
-                # Extract Upload Date
                 date_match = re.search(r'<var class="added">([^<]+)<\/var>', block, re.I)
                 upload_date = date_match.group(1).strip() if date_match else ""
 
@@ -90,7 +87,6 @@ async def explore(q: str = "brazzers", page: int = 1):
                     if thumb.startswith('//'): 
                         thumb = 'https:' + thumb
                     
-                    # HARD BLOCK: Reject missing, broken, base64, or spacer images
                     if not thumb.startswith('http') or 'data:image' in thumb or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
                         continue
 
@@ -164,7 +160,6 @@ async def extract(url: str):
                 except: pass
 
         qualities = []
-        direct_mp4 = {}
 
         for m in media_defs:
             if not isinstance(m, dict): continue
@@ -172,7 +167,6 @@ async def extract(url: str):
             if not v_url: continue
             
             fmt = m.get("format", "")
-            qual = str(m.get("quality", "Auto"))
             if fmt == "hls" or ".m3u8" in v_url:
                 try:
                     m3_r = await http_client.get(v_url, headers=headers)
@@ -187,42 +181,29 @@ async def extract(url: str):
                                 if res_match and res_match.group(1) and 'x' in res_match.group(1):
                                     parts = res_match.group(1).split('x')
                                     if len(parts) > 1: height = parts[1]
-                                lbl = f"{height}p" if height.isdigit() and int(height)>0 else "Auto"
-                                if i+1 < len(lines) and not lines[i+1].startswith("#"):
+                                lbl = f"{height}p" if height.isdigit() and int(height)>0 else ""
+                                if lbl and i+1 < len(lines) and not lines[i+1].startswith("#"):
                                     uri = lines[i+1].strip()
                                     abs_uri = uri if uri.startswith("http") else urljoin(base_url, uri)
                                     if not any(q['url'] == abs_uri for q in qualities):
                                         qualities.append({"quality": lbl, "url": abs_uri})
                 except:
-                    if not any(q['url'] == v_url for q in qualities):
-                        qualities.append({"quality": "Auto", "url": v_url})
-            elif fmt == "mp4" or "mp4" in v_url:
-                clean_qual = qual.replace("[", "").replace("]", "").strip()
-                if not clean_qual or clean_qual == "[]":
-                    clean_qual = "Auto"
-                label = f"{clean_qual}p" if clean_qual.isdigit() else clean_qual.upper()
-                direct_mp4[label] = v_url
+                    pass
 
-        # AGGRESSIVE HLS FALLBACK: Search entire HTML if parsing mediaDefinitions failed
+        # HLS Fallback (Strictly named Source if Auto would be used)
         if not qualities:
             clean_html = html.replace('\\/', '/')
             m3u8_links = set(re.findall(r'(https?:\/\/[^"\'\s]+\.m3u8(?:[^\'"]*))', clean_html))
             for link in m3u8_links:
                 if "master.m3u8" in link or "index.m3u8" in link:
                     if not any(q['url'] == link for q in qualities):
-                        qualities.append({"quality": "Auto", "url": link})
+                        qualities.append({"quality": "Source", "url": link})
 
-        if not direct_mp4:
-            mp4_links = set(re.findall(r'(https?:\/\/[^"\'\s]+\.mp4(?:[^\'"]*))', html.replace('\\/', '/')))
-            for link in mp4_links:
-                if "auto" not in link.lower() and "1080" in link:
-                    direct_mp4["1080p"] = link
-                elif "720" in link:
-                    direct_mp4["720p"] = link
-                elif "480" in link:
-                    direct_mp4["480p"] = link
-                else:
-                    direct_mp4["Auto"] = link
+        # Ensure qualities are sorted highest to lowest if possible
+        def get_res(q):
+            num = re.sub(r'\D', '', q['quality'])
+            return int(num) if num else 0
+        qualities.sort(key=get_res, reverse=True)
 
         if not title or title == "Unknown Title":
             og = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, re.I)
@@ -230,7 +211,7 @@ async def extract(url: str):
 
         return JSONResponse({
             "status": "success", "title": title.strip(), "thumbnail": poster,
-            "streams": {"qualities": qualities, "direct_mp4": direct_mp4}, "url": target_url, "provider": "pornhub"
+            "streams": {"qualities": qualities}, "url": target_url, "provider": "pornhub"
         })
     except Exception as e:
         return JSONResponse({"status": "error", "error": f"Internal API Error: {str(e)}"})
