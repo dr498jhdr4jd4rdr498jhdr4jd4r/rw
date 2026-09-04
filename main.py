@@ -190,7 +190,6 @@ async def extract(url: str):
                 except:
                     pass
 
-        # HLS Fallback (Strictly named Source if Auto would be used)
         if not qualities:
             clean_html = html.replace('\\/', '/')
             m3u8_links = set(re.findall(r'(https?:\/\/[^"\'\s]+\.m3u8(?:[^\'"]*))', clean_html))
@@ -199,7 +198,6 @@ async def extract(url: str):
                     if not any(q['url'] == link for q in qualities):
                         qualities.append({"quality": "Source", "url": link})
 
-        # Ensure qualities are sorted highest to lowest if possible
         def get_res(q):
             num = re.sub(r'\D', '', q['quality'])
             return int(num) if num else 0
