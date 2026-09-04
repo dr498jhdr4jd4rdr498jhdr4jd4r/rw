@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import logging
 from urllib.parse import quote, unquote
@@ -31,7 +32,7 @@ app.add_middleware(
 )
 
 def extract_with_ytdlp(url: str) -> dict:
-    """Blocking yt-dlp extraction logic to be run in a thread pool. STRICTLY HLS."""
+    """Blocking yt-dlp extraction logic with 5 RETRIES. STRICTLY HLS."""
     if url in extraction_cache:
         return extraction_cache[url]
 
@@ -43,68 +44,84 @@ def extract_with_ytdlp(url: str) -> dict:
         'nocheckcertificate': True,
     }
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+    max_retries = 5
+    last_error = "Unknown Error"
 
-        title = info.get('title', 'Unknown Video')
-        thumbnail = info.get('thumbnail', '')
-        
-        # Aggregate all thumbnails
-        thumbnails = [t['url'] for t in info.get('thumbnails', []) if 'url' in t]
-        if thumbnail and thumbnail not in thumbnails:
-            thumbnails.insert(0, thumbnail)
+    for attempt in range(max_retries):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
 
-        qualities = []
-        seen_qualities = set()
-
-        # Parse strictly HLS formats
-        for f in info.get('formats', []):
-            height = f.get('height')
-            if not height:
-                continue
+            title = info.get('title', 'Unknown Video')
+            thumbnail = info.get('thumbnail', '')
             
-            q_label = f"{height}p"
-            f_url = f.get('url', '')
-            protocol = f.get('protocol', '')
-            ext = f.get('ext', '')
+            # Aggregate all thumbnails
+            thumbnails = [t['url'] for t in info.get('thumbnails', []) if 'url' in t]
+            if thumbnail and thumbnail not in thumbnails:
+                thumbnails.insert(0, thumbnail)
 
-            # STRICT FILTER: Only allow m3u8 / HLS streams
-            if 'm3u8' not in protocol and ext != 'm3u8':
+            qualities = []
+            seen_qualities = set()
+
+            # Parse strictly HLS formats
+            for f in info.get('formats', []):
+                height = f.get('height')
+                if not height:
+                    continue
+                
+                q_label = f"{height}p"
+                f_url = f.get('url', '')
+                protocol = f.get('protocol', '')
+                ext = f.get('ext', '')
+
+                # STRICT FILTER: Only allow m3u8 / HLS streams
+                if 'm3u8' not in protocol and ext != 'm3u8':
+                    continue
+
+                if q_label not in seen_qualities:
+                    seen_qualities.add(q_label)
+                    qualities.append({
+                        "quality": q_label,
+                        "url": f_url,
+                        "type": "hls"
+                    })
+
+            # Sort qualities highest to lowest
+            qualities.sort(key=lambda x: int(x['quality'].replace('p', '')), reverse=True)
+
+            if not qualities:
+                last_error = "No valid HLS streams found"
+                if attempt < max_retries - 1:
+                    time.sleep(1.5)  # Wait before retry
+                    continue
+                return {"status": "error", "error": last_error, "url": url}
+
+            result = {
+                "status": "success",
+                "title": title,
+                "thumbnail": thumbnail or (thumbnails[0] if thumbnails else ""),
+                "thumbnails": thumbnails,
+                "streams": {"qualities": qualities},
+                "url": url,
+                "provider": "pornhub"
+            }
+            
+            extraction_cache[url] = result
+            return result
+
+        except yt_dlp.utils.DownloadError as e:
+            last_error = f"Download error: {str(e)}"
+            if attempt < max_retries - 1:
+                time.sleep(1.5)
+                continue
+        except Exception as e:
+            last_error = str(e)
+            logger.error(f"yt-dlp extraction failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1.5)
                 continue
 
-            if q_label not in seen_qualities:
-                seen_qualities.add(q_label)
-                qualities.append({
-                    "quality": q_label,
-                    "url": f_url,
-                    "type": "hls"
-                })
-
-        # Sort qualities highest to lowest
-        qualities.sort(key=lambda x: int(x['quality'].replace('p', '')), reverse=True)
-
-        if not qualities:
-            return {"status": "error", "error": "No valid HLS streams found", "url": url}
-
-        result = {
-            "status": "success",
-            "title": title,
-            "thumbnail": thumbnail or (thumbnails[0] if thumbnails else ""),
-            "thumbnails": thumbnails,
-            "streams": {"qualities": qualities},
-            "url": url,
-            "provider": "pornhub"
-        }
-        
-        extraction_cache[url] = result
-        return result
-
-    except yt_dlp.utils.DownloadError as e:
-        return {"status": "error", "error": f"Download error: {str(e)}", "url": url}
-    except Exception as e:
-        logger.error(f"yt-dlp extraction failed: {e}")
-        return {"status": "error", "error": str(e), "url": url}
+    return {"status": "error", "error": f"Failed after 5 attempts. Last error: {last_error}", "url": url}
 
 
 @app.get("/api/explore")
@@ -199,4 +216,4 @@ async def fallback_proxy_image(url: str):
 
 @app.get("/")
 def health():
-    return {"status": "Online", "engine": "yt-dlp Core (Strict HLS)", "concurrency": "async-threadpool"}
+    return {"status": "Online", "engine": "yt-dlp Core (Strict HLS) + 5 Retries", "concurrency": "async-threadpool"}
