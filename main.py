@@ -4,9 +4,9 @@ import httpx
 import logging
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urljoin, unquote
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -18,15 +18,15 @@ async def lifespan(app: FastAPI):
     global http_client
     http_client = httpx.AsyncClient(
         follow_redirects=True,
-        timeout=httpx.Timeout(35.0, connect=10.0),
-        limits=httpx.Limits(max_connections=400, max_keepalive_connections=80)
+        timeout=httpx.Timeout(40.0, connect=15.0),
+        limits=httpx.Limits(max_connections=500, max_keepalive_connections=100)
     )
-    logger.info("Railway Backend Engine Active.")
+    logger.info("Railway Scraper Core Started.")
     yield
     await http_client.aclose()
-    logger.info("Railway Backend Engine Inactive.")
+    logger.info("Railway Scraper Core Stopped.")
 
-app = FastAPI(title="VexoStream Core API", lifespan=lifespan)
+app = FastAPI(title="VexoStream Enterprise Scraper", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,63 +35,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_clean_headers():
+def get_stealth_headers():
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
         "Referer": "https://www.pornhub.com/",
-        "Origin": "https://www.pornhub.com",
-        "Cookie": "accessAgeDisclaimerPH=1; platform=pc; hasVisited=1; cookiesBanner=1;"
+        "Cookie": "accessAgeDisclaimerPH=1; platform=pc; bs=1; hasVisited=1; cookiesBanner=1;"
     }
-
-def extract_balanced_json(text: str, trigger_key: str):
-    idx = text.find(trigger_key)
-    if idx == -1:
-        return None
-    start_pos = -1
-    is_array = False
-    for i in range(idx + len(trigger_key), len(text)):
-        if text[i] == '{':
-            start_pos = i
-            is_array = False
-            break
-        elif text[i] == '[':
-            start_pos = i
-            is_array = True
-            break
-        elif text[i] in [';', '\n'] and i > idx + 50:
-            break
-    if start_pos == -1:
-        return None
-
-    open_char = '[' if is_array else '{'
-    close_char = ']' if is_array else '}'
-    depth = 0
-    in_string = False
-    escape = False
-
-    for i in range(start_pos, len(text)):
-        char = text[i]
-        if escape:
-            escape = False
-            continue
-        if char == '\\':
-            escape = True
-            continue
-        if char == '"':
-            in_string = not in_string
-            continue
-        if not in_string:
-            if char == open_char:
-                depth += 1
-            elif char == close_char:
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start_pos:i+1])
-                    except Exception:
-                        return None
-    return None
 
 class MediaExtractor:
     @staticmethod
@@ -129,16 +88,36 @@ class MediaExtractor:
 @app.get("/api/explore")
 async def explore(q: str = "brazzers", page: int = 1):
     try:
+        # Strategy 1: Standard Desktop Search
         target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
+        html = ""
+        
         try:
-            r = await http_client.get(target_url, headers=get_clean_headers())
-            html = r.text
+            r = await http_client.get(target_url, headers=get_stealth_headers())
+            if r.status_code == 200 and "data-video-vkey" in r.text:
+                html = r.text
+            else:
+                logger.warning(f"Strategy 1 blocked with status {r.status_code}. Trying mobile fallback...")
         except Exception as err:
-            logger.error(f"Search failed on page {page}: {err}")
+            logger.error(f"Search request failed: {err}")
+
+        # Strategy 2: Mobile Fallback if blocked
+        if not html:
+            try:
+                m_headers = get_stealth_headers()
+                m_headers["User-Agent"] = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+                m_headers["Cookie"] = "accessAgeDisclaimerPH=1; platform=mobile;"
+                r_m = await http_client.get(f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}", headers=m_headers)
+                if r_m.status_code == 200:
+                    html = r_m.text
+            except Exception as e:
+                logger.error(f"Strategy 2 failed: {e}")
+
+        if not html:
             return JSONResponse([])
 
         videos = []
-        blocks = re.split(r'data-video-vkey=["\']', html, flags=re.I)
+        blocks = re.split(r'data-video-vkey=["\']|data-vkey=["\']', html, flags=re.I)
 
         for block in blocks[1:]:
             try:
@@ -150,9 +129,10 @@ async def explore(q: str = "brazzers", page: int = 1):
                     continue
                 vkey = vkey_match.group(1)
 
-                sub_block = block[:3000]
-                title_match = re.search(r'title=["\']([^"\']+)["\']', sub_block, re.I)
-                title = MediaExtractor.clean_title(title_match.group(1)) if title_match else "Unknown Video"
+                sub_block = block[:3500]
+                title_match = re.search(r'title=["\']([^"\']+)["\']|alt=["\']([^"\']+)["\']', sub_block, re.I)
+                title_raw = title_match.group(1) or title_match.group(2) if title_match else "Unknown Video"
+                title = MediaExtractor.clean_title(title_raw)
 
                 if MediaExtractor.is_ad(title):
                     continue
@@ -180,9 +160,10 @@ async def explore(q: str = "brazzers", page: int = 1):
             except Exception:
                 continue
 
+        logger.info(f"Page {page}: successfully extracted {len(videos)} videos.")
         return JSONResponse(videos)
     except Exception as e:
-        logger.error(f"Explore Endpoint Error: {e}")
+        logger.error(f"Explore Endpoint Failure: {e}")
         return JSONResponse([])
 
 @app.get("/api/extract")
@@ -199,26 +180,34 @@ async def extract(url: str):
         target_url = f"https://www.pornhub.com/view_video.php?viewkey={vkey}"
 
         try:
-            r = await http_client.get(target_url, headers=get_clean_headers())
+            r = await http_client.get(target_url, headers=get_stealth_headers())
             html = r.text
         except Exception as e:
-            return JSONResponse({"status": "error", "error": f"Upstream connection failed: {str(e)}"})
+            return JSONResponse({"status": "error", "error": f"Upstream error: {str(e)}"})
 
         title = ""
         poster = ""
         media_defs = []
 
-        flashvars_data = extract_balanced_json(html, "flashvars_") or \
-                         extract_balanced_json(html, "playerObjList_") or \
-                         extract_balanced_json(html, "flashvars")
-
-        if flashvars_data and isinstance(flashvars_data, dict):
-            media_defs = flashvars_data.get("mediaDefinitions", [])
-            title = flashvars_data.get("video_title", "")
-            poster = flashvars_data.get("image_url") or flashvars_data.get("thumb_url") or ""
+        fv_match = re.search(r'flashvars_\d+\s*=\s*(\{.*?\});', html, re.DOTALL) or \
+                   re.search(r'flashvars\s*=\s*(\{.*?\});', html, re.DOTALL) or \
+                   re.search(r'var\s+playerObjList\s*=\s*(\{.*?\});', html, re.DOTALL)
+        if fv_match:
+            try:
+                data = json.loads(fv_match.group(1))
+                media_defs = data.get("mediaDefinitions", [])
+                title = data.get("video_title", "")
+                poster = data.get("image_url") or data.get("thumb_url") or ""
+            except Exception:
+                pass
 
         if not media_defs:
-            media_defs = extract_balanced_json(html, '"mediaDefinitions"') or []
+            md_raw = re.search(r'"mediaDefinitions"\s*:\s*(\[\{.*?\}\])', html, re.DOTALL)
+            if md_raw:
+                try:
+                    media_defs = json.loads(md_raw.group(1))
+                except Exception:
+                    pass
 
         if not title:
             h1_match = re.search(r'<h1[^>]*class="[^"]*title[^"]*"[^>]*>(?:<span[^>]*class="inlineFree"[^>]*>)?([^<]+)', html, re.I)
@@ -258,7 +247,7 @@ async def extract(url: str):
 
             if is_hls and ("master.m3u8" in v_url or "index.m3u8" in v_url):
                 try:
-                    m3_r = await http_client.get(v_url, headers={"User-Agent": get_clean_headers()["User-Agent"], "Referer": "https://www.pornhub.com/"})
+                    m3_r = await http_client.get(v_url, headers={"User-Agent": get_stealth_headers()["User-Agent"], "Referer": "https://www.pornhub.com/"})
                     if m3_r.status_code == 200 and "#EXT-X-STREAM-INF" in m3_r.text:
                         lines = m3_r.text.splitlines()
                         base_url = v_url[:v_url.rfind('/')+1]
@@ -316,9 +305,8 @@ async def extract(url: str):
 
 @app.get("/proxy-image")
 async def fallback_proxy_image(url: str):
-    """Fallback high-speed image streamer."""
     try:
-        req = http_client.build_request("GET", unquote(url), headers=get_clean_headers())
+        req = http_client.build_request("GET", unquote(url), headers=get_stealth_headers())
         r = await http_client.send(req, stream=True)
         return StreamingResponse(r.aiter_raw(), status_code=r.status_code, headers={"Content-Type": r.headers.get("Content-Type", "image/jpeg"), "Access-Control-Allow-Origin": "*"})
     except Exception:
@@ -326,4 +314,4 @@ async def fallback_proxy_image(url: str):
 
 @app.get("/")
 def read_root():
-    return {"status": "Proxy Online", "gateway": "Railway VexoStream Core"}
+    return {"status": "Online", "gateway": "VexoStream Scraper Core"}
