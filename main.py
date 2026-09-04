@@ -3,7 +3,7 @@ import json
 import httpx
 import logging
 from contextlib import asynccontextmanager
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, unquote
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -101,13 +101,13 @@ class MediaExtractor:
         for attr in ['data-mediumthumb', 'data-thumb_url', 'data-image', 'data-src', 'src']:
             match = re.search(rf'{attr}=["\'](https?://[^"\']+\.(?:jpg|jpeg|webp|png)(?:\?[^"\']*)?)["\']', block, re.I)
             if match:
-                img = match.group(1).replace(r"\/", "/")
+                img = match.group(1).replace(r"\/", "/").replace("&amp;", "&")
                 if not any(bad in img.lower() for bad in ['pixel', 'blank', 'transparent', 'data:image', '.webm', '.mp4']):
                     return img
 
         match = re.search(r'(https?://[^\s"\'<>]*(?:phncdn|pornhub)[^\s"\'<>]*(?:\.jpg|\.webp|\.jpeg|\.png)(?:\?[^\s"\'<>]*)?)', block, re.I)
         if match:
-            img = match.group(1).replace(r"\/", "/")
+            img = match.group(1).replace(r"\/", "/").replace("&amp;", "&")
             if not any(bad in img.lower() for bad in ['pixel', 'blank', 'transparent', '.webm', '.mp4']):
                 return img
         return ""
@@ -131,7 +131,6 @@ class MediaExtractor:
 @app.get("/api/explore")
 async def explore(q: str = "brazzers", page: int = 1):
     try:
-        # Uniform target query matching all pagination depths
         target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
         logger.info(f"Scraping Page {page}: {target_url}")
 
@@ -143,7 +142,6 @@ async def explore(q: str = "brazzers", page: int = 1):
             return JSONResponse([])
 
         videos = []
-        # Robust universal splitting using data-video-vkey (Consistent on page 1, 2, 3...)
         blocks = re.split(r'data-video-vkey=["\']', html, flags=re.I)
 
         for block in blocks[1:]:
@@ -340,7 +338,7 @@ async def extract(url: str):
         return JSONResponse({
             "status": "success",
             "title": title,
-            "thumbnail": poster.replace(r"\/", "/") if poster else "",
+            "thumbnail": poster.replace(r"\/", "/").replace("&amp;", "&") if poster else "",
             "streams": {"qualities": qualities},
             "url": target_url,
             "provider": "pornhub"
