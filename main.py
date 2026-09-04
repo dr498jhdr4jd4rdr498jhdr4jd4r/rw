@@ -67,13 +67,20 @@ async def explore(q: str = "brazzers", page: int = 1):
         
         for block in blocks[1:]:
             try:
-                block = block[:1500]
+                block = block[:2500]
                 vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
                 title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
                 
-                # Strict thumbnail matching
-                thumb_match = re.search(r'(?:data-thumb_url|data-mediabook|data-src|src)="([^"]+\.(?:jpg|jpeg|png|webp|gif)[^"]*)"', block, re.I)
+                # STRICT THUMBNAIL EXTRACTION: Prioritize real data-thumb attributes
+                thumb_match = re.search(r'data-(?:thumb_url|mediabook|image)="([^"]+)"', block, re.I)
+                if not thumb_match:
+                    thumb_match = re.search(r'src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
+                
                 dur_match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.I)
+                
+                # Extract Upload Date
+                date_match = re.search(r'<var class="added">([^<]+)<\/var>', block, re.I)
+                upload_date = date_match.group(1).strip() if date_match else ""
 
                 if vkey_match and title_match and thumb_match:
                     vkey = vkey_match.group(1)
@@ -83,8 +90,8 @@ async def explore(q: str = "brazzers", page: int = 1):
                     if thumb.startswith('//'): 
                         thumb = 'https:' + thumb
                     
-                    # Core fix: Strict block against broken/empty thumbnails
-                    if not thumb.startswith('http') or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
+                    # HARD BLOCK: Reject missing, broken, base64, or spacer images
+                    if not thumb.startswith('http') or 'data:image' in thumb or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
                         continue
 
                     dur = "HD"
@@ -96,8 +103,13 @@ async def explore(q: str = "brazzers", page: int = 1):
                     
                     if not is_ad and not any(v['vkey'] == vkey for v in videos):
                         videos.append({
-                            "vkey": vkey, "title": title, "thumbnail": thumb, "duration": dur,
-                            "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}", "provider": "pornhub"
+                            "vkey": vkey, 
+                            "title": title, 
+                            "thumbnail": thumb, 
+                            "duration": dur,
+                            "date": upload_date,
+                            "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}", 
+                            "provider": "pornhub"
                         })
                 if len(videos) >= 48: break
             except Exception:
@@ -191,15 +203,17 @@ async def extract(url: str):
                 label = f"{clean_qual}p" if clean_qual.isdigit() else clean_qual.upper()
                 direct_mp4[label] = v_url
 
-        # Core fix: Quality Selection Fallback Logic
+        # AGGRESSIVE HLS FALLBACK: Search entire HTML if parsing mediaDefinitions failed
         if not qualities:
-            m3u8_links = re.findall(r'https?:\/\/[^"\']+\.m3u8(?:\?[^"\']*)?', html)
+            clean_html = html.replace('\\/', '/')
+            m3u8_links = set(re.findall(r'(https?:\/\/[^"\'\s]+\.m3u8(?:[^\'"]*))', clean_html))
             for link in m3u8_links:
-                if not any(q['url'] == link for q in qualities):
-                    qualities.append({"quality": "Auto", "url": link})
+                if "master.m3u8" in link or "index.m3u8" in link:
+                    if not any(q['url'] == link for q in qualities):
+                        qualities.append({"quality": "Auto", "url": link})
 
         if not direct_mp4:
-            mp4_links = re.findall(r'https?:\/\/[^"\']+\.mp4(?:\?[^"\']*)?', html)
+            mp4_links = set(re.findall(r'(https?:\/\/[^"\'\s]+\.mp4(?:[^\'"]*))', html.replace('\\/', '/')))
             for link in mp4_links:
                 if "auto" not in link.lower() and "1080" in link:
                     direct_mp4["1080p"] = link
