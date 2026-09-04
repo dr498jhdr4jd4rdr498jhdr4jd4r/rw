@@ -86,15 +86,25 @@ class PornhubScraper:
                     line_clean = line.strip()
                     if line_clean.startswith("#EXT-X-STREAM-INF:"):
                         res_match = re.search(r"RESOLUTION=(\d+x\d+)", line_clean)
-                        height = res_match.group(1).split("x")[1] if res_match and "x" in res_match.group(1) else "0"
+                        height = "0"
+                        if res_match:
+                            parts = res_match.group(1).split("x")
+                            if len(parts) == 2:
+                                height = parts[1]
+                        
                         if height.isdigit() and int(height) > 0:
                             quality_label = f"{height}p"
-                            if i + 1 < len(lines) and not lines[i + 1].strip().startswith("#"):
-                                stream_uri = lines[i + 1].strip()
-                                stream_url = stream_uri if stream_uri.startswith('http') else urljoin(base_url, stream_uri)
-                                qualities.append({"quality": quality_label, "url": stream_url, "type": "hls"})
-        except Exception:
-            pass
+                            idx = i + 1
+                            while idx < len(lines) and lines[idx].strip().startswith("#"):
+                                idx += 1
+                            if idx < len(lines):
+                                stream_uri = lines[idx].strip()
+                                if stream_uri:
+                                    stream_url = stream_uri if stream_uri.startswith('http') else urljoin(base_url, stream_uri)
+                                    if not any(q['quality'] == quality_label for q in qualities):
+                                        qualities.append({"quality": quality_label, "url": stream_url, "type": "hls"})
+        except Exception as e:
+            logger.error(f"Error parsing master m3u8: {e}")
 
         if not qualities:
             try:
@@ -205,8 +215,9 @@ class PornhubScraper:
                         seen_q.add(pq["quality"])
                         stream_data["qualities"].append(pq)
 
-        if not stream_data["qualities"]:
-            return {"status": "error", "error": "Video streams could not be extracted from page.", "url": url}
+        # Ensure all high qualities are thoroughly collected before returning
+        if not stream_data["qualities"] or len(stream_data["qualities"]) < 2:
+            return {"status": "error", "error": "Incomplete or missing video qualities extracted.", "url": url}
 
         return {
             "status": "success",
@@ -246,7 +257,6 @@ def explore(q: str = "brazzers", page: int = 1):
         videos = []
         search_words = [w.strip().lower() for w in q.split() if w.strip()]
 
-        # Phase 1: Try strict match first
         for item in items:
             vkey = item.get("data-video-vkey") or (item.xpath('.//@data-video-vkey') or [None])[0]
             if not vkey:
@@ -270,7 +280,6 @@ def explore(q: str = "brazzers", page: int = 1):
                     "provider": "pornhub"
                 })
 
-        # Phase 2: If strict match gives fewer than 20 items, fill the page up to 20 using all available items from the same search result page
         if len(videos) < 20:
             for item in items:
                 vkey = item.get("data-video-vkey") or (item.xpath('.//@data-video-vkey') or [None])[0]
