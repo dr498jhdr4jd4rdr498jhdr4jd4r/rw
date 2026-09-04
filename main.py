@@ -53,7 +53,7 @@ def get_clean_headers(request: Request):
 @app.get("/api/explore")
 async def explore(q: str = "brazzers", page: int = 1):
     try:
-        target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
+        target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}&o=mv"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", 
             "Cookie": "accessAgeDisclaimerPH=1; platform=pc;",
@@ -71,7 +71,7 @@ async def explore(q: str = "brazzers", page: int = 1):
         
         for block in blocks[1:]:
             try:
-                block = block[:3000]
+                block = block[:3500]
                 vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
                 if not vkey_match:
                     continue
@@ -80,7 +80,7 @@ async def explore(q: str = "brazzers", page: int = 1):
                 title_match = re.search(r'(?:title|alt)\s*=\s*"([^"]+)"', block, re.I)
                 title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip() if title_match else f"Video {vkey}"
                 
-                thumb_match = re.search(r'data-(?:mediumthumb|thumb|thumb_url|mediabook|image)\s*=\s*"([^"]+)"', block, re.I)
+                thumb_match = re.search(r'data-(?:mediabook|thumb_url|mediumthumb|thumb|image|src)\s*=\s*"([^"]+)"', block, re.I)
                 if not thumb_match:
                     thumb_match = re.search(r'src\s*=\s*"([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
                 
@@ -89,7 +89,7 @@ async def explore(q: str = "brazzers", page: int = 1):
                 if thumb.startswith('//'): 
                     thumb = 'https:' + thumb
                 
-                if not thumb or not thumb.startswith('http') or any(x in thumb for x in ['data:image', 'pixel', 'transparent', 'blank', 'spinner']):
+                if not thumb or not thumb.startswith('http') or any(x in thumb for x in ['data:image', 'pixel', 'transparent', 'blank', 'spinner', 'l.gif']):
                     continue
 
                 dur_match = re.search(r'<(?:var|span)\s+class="duration"[^>]*>([^<]+)</(?:var|span)>', block, re.I)
@@ -240,6 +240,7 @@ async def proxy_image(url: str, request: Request):
     target_url = unquote(url)
     req_headers = get_clean_headers(request)
     req_headers["Referer"] = "https://www.pornhub.com/"
+    req_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     try:
         req = http_client.build_request("GET", target_url, headers=req_headers)
         r = await http_client.send(req, stream=True)
