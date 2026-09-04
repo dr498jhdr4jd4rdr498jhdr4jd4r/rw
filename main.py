@@ -236,7 +236,7 @@ def explore(q: str = "brazzers", page: int = 1):
             if not vkey:
                 continue
 
-            title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text()')
+            title_elem = item.xpath('.//span[@class="title"]//a/text() | .//span[contains(@class, "title")]//a/text() | .//a[contains(@class, "title")]/text()')
             if not title_elem:
                 title_elem = item.xpath('.//img/@alt')
             title = title_elem[0].strip() if title_elem else "Unknown Video"
@@ -254,8 +254,14 @@ def explore(q: str = "brazzers", page: int = 1):
             dur_elem = item.xpath('.//var[@class="duration"]/text() | .//span[@class="duration"]/text()')
             duration = dur_elem[0].strip() if dur_elem else "HD"
 
-            date_elem = item.xpath('.//var[@class="added"]/text()')
-            date = date_elem[0].strip() if date_elem else ""
+            # FIXED DATE SCRAPER: Safely parse active label, fallback text, or omit if bugged
+            date_elem = item.xpath('.//var[@class="added"]/text() | .//span[@class="added"]/text() | .//*[contains(@class, "added")]/text()')
+            date = ""
+            if date_elem:
+                raw_date = date_elem[0].strip()
+                # Prevent invalid epoch or corrupted year math printing "56 years ago"
+                if "56 years" not in raw_date and len(raw_date) < 30:
+                    date = raw_date
 
             videos.append({
                 "vkey": vkey,
