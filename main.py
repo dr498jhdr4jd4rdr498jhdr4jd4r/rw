@@ -14,10 +14,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# PORNHUB DEDICATED SCRAPER CORE
-# ============================================================================
-
 class PornhubScraper:
     def __init__(self):
         self.headers = {
@@ -204,10 +200,6 @@ class PornhubScraper:
 
 scraper = PornhubScraper()
 
-# ============================================================================
-# FASTAPI APPLICATION
-# ============================================================================
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
@@ -249,12 +241,10 @@ def explore(q: str = "brazzers", page: int = 1):
                 title_elem = item.xpath('.//img/@alt')
             title = title_elem[0].strip() if title_elem else "Unknown Video"
 
-            # Strict Case-Insensitive Filter: Every search word must be in the title
             title_lower = title.lower()
             if search_words and not all(w in title_lower for w in search_words):
                 continue
 
-            # Core Thumbnail Scanner: Extract and filter broken or dummy placeholders
             raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@data-src | .//img/@src')
             clean_thumbs = scraper.clean_thumbnails(raw_thumbs, "https://www.pornhub.com/")
             if not clean_thumbs:
