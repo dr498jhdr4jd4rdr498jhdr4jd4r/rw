@@ -36,12 +36,13 @@ class PornhubScraper:
             parsed = urlparse(url)
             headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
 
-        try:
-            resp = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
-            if resp.status_code == 200:
-                return resp
-        except Exception:
-            pass
+        for _ in range(2):  # Retry mechanism for first-time reliable fetch
+            try:
+                resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+                if resp.status_code == 200:
+                    return resp
+            except Exception:
+                pass
 
         if self.proxies.get("http") or self.proxies.get("https"):
             try:
@@ -95,6 +96,21 @@ class PornhubScraper:
         except Exception:
             pass
 
+        # Fallback parsing if standard resolution tags are formatted differently
+        if not qualities:
+            try:
+                resp = self._fetch_page(master_m3u8_url, referer)
+                if resp:
+                    for line in resp.text.splitlines():
+                        if 'm3u8' in line and not line.startswith('#'):
+                            u = line.strip()
+                            full_u = u if u.startswith('http') else urljoin(master_m3u8_url, u)
+                            for q_val in ['1080p', '720p', '480p', '360p', '240p']:
+                                if q_val in full_u.lower() and not any(x['quality'] == q_val for x in qualities):
+                                    qualities.append({"quality": q_val, "url": full_u, "type": "hls"})
+            except Exception:
+                pass
+
         qualities.sort(key=lambda x: int(re.search(r'(\d+)', x['quality']).group(1)) if re.search(r'(\d+)', x['quality']) else 0, reverse=True)
         return qualities
 
@@ -124,7 +140,7 @@ class PornhubScraper:
 
             page_text = resp.text
             
-            # Robust extraction of flashvars/player settings across different Pornhub UI variants
+            # Deep search for player flashvars and media definitions
             fv_match = re.search(r'(?:var\s+)?flashvars_\d+\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
                        re.search(r'(?:var\s+)?flashvars\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
                        re.search(r'playerObjList\s*=\s*(\{.*?\});', page_text, re.DOTALL)
@@ -166,12 +182,14 @@ class PornhubScraper:
         stream_data = {"qualities": []}
         seen_q = set()
 
+        # Prioritize HLS master playlists to collect all resolutions on the first attempt
         for m in media_defs:
             if not isinstance(m, dict):
                 continue
             v_url = m.get('videoUrl') or m.get('url')
             if not v_url or not isinstance(v_url, str):
                 continue
+            v_url = v_url.replace('\\/', '/')
 
             fmt = m.get('format', '').lower()
             if fmt == 'hls' or '.m3u8' in v_url:
@@ -264,7 +282,6 @@ def explore(q: str = "brazzers", page: int = 1):
                 "provider": "pornhub"
             })
 
-            # Ensure complete collection per page (at least 20 items per page limit)
             if len(videos) >= 44:
                 break
 
