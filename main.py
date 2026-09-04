@@ -1,9 +1,12 @@
+import os
 import re
 import json
-import httpx
 import logging
+from urllib.parse import urlparse, urljoin, quote, unquote
 from contextlib import asynccontextmanager
-from urllib.parse import quote, urljoin, unquote
+
+import requests
+from lxml import html
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -11,22 +14,327 @@ from fastapi.responses import JSONResponse, StreamingResponse
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-http_client: httpx.AsyncClient = None
+# ============================================================================
+# CORE SCRAPER ENGINE (PORNHUB, XNXX, XVIDEOS, 3MOVS)
+# ============================================================================
+
+class VideoScraper:
+    def __init__(self):
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cookie': 'has_accepted_cookie=1; age_verified=1; platform=pc; accessAgeDisclaimerPH=1; accessAgeDisclaimer=1;'
+        }
+        self.proxies = {
+            "http": os.getenv("HTTP_PROXY", ""),
+            "https": os.getenv("HTTPS_PROXY", "")
+        }
+
+    def _fetch_page(self, url, referer=None):
+        headers = self.headers.copy()
+        if referer:
+            headers['Referer'] = referer
+            headers['Origin'] = referer.rstrip('/')
+        else:
+            parsed = urlparse(url)
+            headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=12, allow_redirects=True)
+            if resp.status_code == 200:
+                return resp
+        except Exception:
+            pass
+
+        if self.proxies.get("http") or self.proxies.get("https"):
+            try:
+                return requests.get(url, headers=headers, proxies=self.proxies, timeout=20, allow_redirects=True)
+            except Exception:
+                pass
+        return None
+
+    def title_case(self, text):
+        return re.sub(r"\b\w", lambda m: m.group(0).upper(), text.strip().lower()) if text else ""
+
+    def clean_thumbnails(self, thumbs, base_url):
+        clean = []
+        seen = set()
+        for t in thumbs:
+            if not t or not isinstance(t, str):
+                continue
+            t = t.replace('\\/', '/').replace('&amp;', '&').strip().strip('\'"')
+            if t.startswith('//'):
+                t = "https:" + t
+            elif t.startswith('/'):
+                t = urljoin(base_url, t)
+
+            if t.startswith('http'):
+                t_lower = t.lower()
+                if any(bad in t_lower for bad in ['favicon', 'logo', 'icon', 'banner', 'avatar', 'blank', 'pixel', 'sprite', 'timeline', '.vtt', '.gif']):
+                    continue
+                if not any(ext in t_lower for ext in ['.jpg', '.jpeg', '.png', '.webp', 'preview', 'thumb', 'poster', 'screenshots']):
+                    continue
+
+                if t not in seen:
+                    seen.add(t)
+                    clean.append(t)
+        return clean
+
+    def parse_hls_qualities(self, master_m3u8_url, referer=None):
+        qualities = []
+        try:
+            resp = self._fetch_page(master_m3u8_url, referer)
+            if resp and resp.status_code == 200:
+                lines = resp.text.splitlines()
+                base_url = master_m3u8_url.rsplit('/', 1)[0] + '/'
+                for i, line in enumerate(lines):
+                    line_clean = line.strip()
+                    if line_clean.startswith("#EXT-X-STREAM-INF:"):
+                        res_match = re.search(r"RESOLUTION=(\d+x\d+)", line_clean)
+                        height = res_match.group(1).split("x")[1] if res_match and "x" in res_match.group(1) else "0"
+                        quality_label = f"{height}p" if height.isdigit() and int(height) > 0 else "Adaptive Auto"
+
+                        if i + 1 < len(lines) and not lines[i + 1].strip().startswith("#"):
+                            stream_uri = lines[i + 1].strip()
+                            stream_url = stream_uri if stream_uri.startswith('http') else urljoin(base_url, stream_uri)
+                            qualities.append({"quality": quality_label, "url": stream_url})
+        except Exception:
+            pass
+
+        qualities.sort(key=lambda x: int(re.search(r'(\d+)', x['quality']).group(1)) if re.search(r'(\d+)', x['quality']) else 0, reverse=True)
+        if not qualities:
+            qualities.append({"quality": "HLS Master", "url": master_m3u8_url})
+        return qualities
+
+    def _scrape_pornhub(self, url):
+        viewkey = None
+        if 'viewkey=' in url:
+            viewkey = url.split('viewkey=')[1].split('&')[0]
+        elif 'embed/' in url:
+            viewkey = url.split('embed/')[1].split('?')[0]
+        if not viewkey:
+            return {"status": "error", "error": "Invalid viewkey identifier", "url": url}
+
+        standard_url = f"https://www.pornhub.com/view_video.php?viewkey={viewkey}"
+        title, poster, media_defs = "Pornhub Video", "", []
+        raw_thumbs = set()
+        page_text = ""
+
+        try:
+            resp = self._fetch_page(standard_url, referer="https://www.pornhub.com/")
+            if not resp or resp.status_code != 200:
+                return {"status": "error", "error": "Failed to fetch source page", "url": url}
+
+            page_text = resp.text
+            fv_match = re.search(r'var\s+flashvars_\d+\s*=\s*(\{.*?\});', page_text, re.DOTALL) or re.search(r'flashvars(?:_\d+)?\s*=\s*(\{.*?\});', page_text, re.DOTALL)
+            if fv_match:
+                try:
+                    data = json.loads(fv_match.group(1))
+                    media_defs = data.get('mediaDefinitions', [])
+                    title = data.get('video_title') or title
+                    poster = data.get('image_url') or data.get('thumb_url') or poster
+
+                    if poster:
+                        raw_thumbs.add(poster)
+                    for _, v in data.items():
+                        if isinstance(v, str) and v.startswith('http') and any(ext in v.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
+                            raw_thumbs.add(v)
+                except Exception:
+                    pass
+
+            if not media_defs:
+                md_match = re.search(r'"mediaDefinitions"\s*:\s*(\[\{.*?\}\])', page_text, re.DOTALL)
+                if md_match:
+                    try:
+                        media_defs = json.loads(md_match.group(1))
+                    except Exception:
+                        pass
+        except Exception as e:
+            return {"status": "error", "error": str(e), "url": url}
+
+        if title == "Pornhub Video":
+            og_match = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', page_text, re.I)
+            if og_match:
+                title = og_match.group(1).replace(" - Pornhub.com", "").strip()
+
+        clean_thumbs = self.clean_thumbnails(raw_thumbs, standard_url)
+        if clean_thumbs and not poster:
+            poster = clean_thumbs[0]
+
+        stream_data = {"direct_mp4": {}, "qualities": []}
+        seen_q = set()
+
+        for m in media_defs:
+            if not isinstance(m, dict):
+                continue
+            v_url = m.get('videoUrl') or m.get('url')
+            if not v_url or not isinstance(v_url, str):
+                continue
+
+            fmt = m.get('format', '').lower()
+            qual_raw = m.get('quality')
+            qual = str(qual_raw[0]) if isinstance(qual_raw, list) and qual_raw else str(qual_raw or "auto")
+            if qual == "[]" or not qual:
+                qual = "auto"
+
+            if fmt == 'mp4' or ('.mp4' in v_url and 'm3u8' not in v_url):
+                q_label = f"{qual}p" if qual.isdigit() else qual.upper()
+                stream_data["direct_mp4"][q_label] = v_url
+
+            if fmt == 'hls' or '.m3u8' in v_url:
+                parsed_streams = self.parse_hls_qualities(v_url, referer=standard_url)
+                for pq in parsed_streams:
+                    if pq["quality"] not in seen_q:
+                        seen_q.add(pq["quality"])
+                        stream_data["qualities"].append(pq)
+
+        return {
+            "status": "success",
+            "title": title.strip(),
+            "thumbnail": poster,
+            "thumbnails": clean_thumbs,
+            "streams": stream_data,
+            "url": url,
+            "provider": "pornhub"
+        }
+
+    def _scrape_xnxx_xvideos(self, url):
+        try:
+            resp = self._fetch_page(url)
+            if not resp or resp.status_code != 200:
+                return {"status": "error", "error": f"HTTP {resp.status_code if resp else 'No Response'}", "url": url}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "url": url}
+
+        page = resp.text
+        tree = html.fromstring(resp.content)
+        title_raw = tree.xpath('//meta[@property="og:title"]/@content')
+        title = self.title_case(title_raw[0]) if title_raw else "Video Player"
+        thumb_raw = tree.xpath('//meta[@property="og:image"]/@content')
+
+        raw_thumbs = set()
+        if thumb_raw:
+            raw_thumbs.add(thumb_raw[0])
+        for m in re.finditer(r'setThumbUrl(?:169|Slide|)?\(\s*[\'"](https?://[^\'"]+)[\'"]\s*\)', page):
+            raw_thumbs.add(m.group(1))
+
+        clean_thumbs = self.clean_thumbnails(raw_thumbs, url)
+        thumbnail = clean_thumbs[0] if clean_thumbs else ""
+
+        stream_data = {"direct_mp4": {}, "qualities": []}
+        hls_match = re.search(r'(?:setVideoHLS|html5player\.setVideoHLS)\(\s*[\'"]([^\'"]+)[\'"]\s*\)', page)
+        high_match = re.search(r'(?:setVideoUrlHigh|html5player\.setVideoUrlHigh)\(\s*[\'"]([^\'"]+)[\'"]\s*\)', page)
+        low_match = re.search(r'(?:setVideoUrlLow|html5player\.setVideoUrlLow)\(\s*[\'"]([^\'"]+)[\'"]\s*\)', page)
+
+        if hls_match:
+            stream_data["qualities"] = self.parse_hls_qualities(hls_match.group(1), referer=url)
+        if high_match:
+            stream_data["direct_mp4"]["720p"] = high_match.group(1)
+        if low_match:
+            stream_data["direct_mp4"]["360p"] = low_match.group(1)
+
+        return {
+            "status": "success",
+            "title": title.strip(),
+            "thumbnail": thumbnail,
+            "thumbnails": clean_thumbs,
+            "streams": stream_data,
+            "url": url,
+            "provider": "xnxx" if "xnxx" in url else "xvideos"
+        }
+
+    def _scrape_3movs(self, url):
+        try:
+            resp = self._fetch_page(url)
+            if not resp or resp.status_code != 200:
+                return {"status": "error", "error": f"HTTP {resp.status_code if resp else 'No Response'}", "url": url}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "url": url}
+
+        page = resp.text
+        tree = html.fromstring(resp.content)
+
+        title_raw = tree.xpath('//meta[@property="og:title"]/@content')
+        title = self.title_case(title_raw[0]) if title_raw else "Video Player"
+        if title == "Video Player":
+            title_tag = tree.xpath('//title/text()')
+            if title_tag:
+                title = title_tag[0].split('|')[0].split('-')[0].strip()
+
+        raw_thumbs = set()
+        for meta in tree.xpath('//meta[@property="og:image"]/@content | //meta[@name="twitter:image"]/@content'):
+            raw_thumbs.add(meta)
+        for poster in tree.xpath('//video/@poster | //div[contains(@id, "player")]//img/@src'):
+            raw_thumbs.add(poster)
+        for m in re.finditer(r'poster(?:Image)?\s*[:=]\s*["\']([^"\']+)["\']', page, re.I):
+            raw_thumbs.add(m.group(1))
+
+        clean_thumbs = self.clean_thumbnails(raw_thumbs, url)
+        thumbnail = clean_thumbs[0] if clean_thumbs else ""
+
+        stream_data = {"direct_mp4": {}, "qualities": []}
+        candidates = []
+
+        player_source_elements = tree.xpath('//div[contains(@id, "player") or contains(@class, "player")]//video//source | //video//source')
+        for s in player_source_elements:
+            src = s.get('src')
+            if src:
+                candidates.append(src)
+
+        if not candidates:
+            for m in re.finditer(r'(?:video_url|video_alt_url|src|file)\s*[:=]\s*["\']([^"\']+)["\']', page):
+                candidates.append(m.group(1))
+
+        for raw_src in set(candidates):
+            full_src = raw_src.replace('\\/', '/').strip()
+            if full_src.startswith('//'):
+                full_src = "https:" + full_src
+            elif full_src.startswith('/'):
+                full_src = urljoin(url, full_src)
+
+            if '.m3u8' in full_src:
+                for q in self.parse_hls_qualities(full_src, referer=url):
+                    stream_data["qualities"].append(q)
+            elif '.mp4' in full_src:
+                res_match = re.search(r'(\d{3,4})[pP]?', full_src)
+                label = f"{res_match.group(1)}p" if res_match else "Direct MP4"
+                stream_data["direct_mp4"][label] = full_src
+
+        return {
+            "status": "success",
+            "title": title.strip(),
+            "thumbnail": thumbnail,
+            "thumbnails": clean_thumbs,
+            "streams": stream_data,
+            "url": url,
+            "provider": "3movs"
+        }
+
+    def extract(self, url):
+        m = re.search(r"\[([a-z0-9]{6,8})\]\.[^.]+$", url, re.I) or re.match(r"^([a-z0-9]{6,8})_.+", url, re.I)
+        if m:
+            url = f"https://www.xnxx.com/video-{m.group(1)}/x"
+
+        if 'pornhub' in url:
+            return self._scrape_pornhub(url)
+        elif 'xnxx' in url or 'xvideos' in url:
+            return self._scrape_xnxx_xvideos(url)
+        elif '3movs' in url:
+            return self._scrape_3movs(url)
+        return {"status": "error", "error": "Unsupported provider"}
+
+scraper = VideoScraper()
+
+# ============================================================================
+# FASTAPI CORE APPLICATION
+# ============================================================================
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    global http_client
-    http_client = httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=httpx.Timeout(35.0, connect=10.0),
-        limits=httpx.Limits(max_connections=500, max_keepalive_connections=100)
-    )
-    logger.info("Railway Scraper Core Initialized.")
+async def lifespan_context(app: FastAPI):
     yield
-    await http_client.aclose()
-    logger.info("Railway Scraper Core Terminated.")
 
-app = FastAPI(title="VexoStream Enterprise Scraper", lifespan=lifespan)
+app = FastAPI(title="VexoStream Enterprise Core", lifespan=lifespan_context)
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,364 +343,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_stealth_headers():
-    return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "Referer": "https://www.pornhub.com/",
-        "Cookie": "accessAgeDisclaimerPH=1; platform=pc; bs=1; hasVisited=1; cookiesBanner=1;"
-    }
-
-def extract_balanced_json(text: str, trigger_key: str):
-    idx = text.find(trigger_key)
-    if idx == -1:
-        return None
-    
-    start_pos = -1
-    is_array = False
-    for i in range(idx + len(trigger_key), len(text)):
-        if text[i] == '{':
-            start_pos = i
-            is_array = False
-            break
-        elif text[i] == '[':
-            start_pos = i
-            is_array = True
-            break
-        elif text[i] in [';', '\n'] and i > idx + 50:
-            break
-            
-    if start_pos == -1:
-        return None
-
-    open_char = '[' if is_array else '{'
-    close_char = ']' if is_array else '}'
-    depth = 0
-    in_string = False
-    escape = False
-
-    for i in range(start_pos, len(text)):
-        char = text[i]
-        if escape:
-            escape = False
-            continue
-        if char == '\\':
-            escape = True
-            continue
-        if char == '"':
-            in_string = not in_string
-            continue
-        if not in_string:
-            if char == open_char:
-                depth += 1
-            elif char == close_char:
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start_pos:i+1])
-                    except Exception:
-                        return None
-    return None
-
-class MediaExtractor:
-    @staticmethod
-    def extract_thumbnail(block: str) -> str:
-        for attr in ['data-mediumthumb', 'data-thumb_url', 'data-image', 'data-src', 'src']:
-            match = re.search(rf'{attr}=["\'](https?://[^"\']+\.(?:jpg|jpeg|webp|png)(?:\?[^"\']*)?)["\']', block, re.I)
-            if match:
-                img = match.group(1).replace(r"\/", "/").replace("&amp;", "&")
-                if not any(bad in img.lower() for bad in ['pixel', 'blank', 'transparent', 'data:image', '.webm', '.mp4']):
-                    return img
-
-        match = re.search(r'(https?://[^\s"\'<>]*(?:phncdn|pornhub)[^\s"\'<>]*(?:\.jpg|\.webp|\.jpeg|\.png)(?:\?[^\s"\'<>]*)?)', block, re.I)
-        if match:
-            img = match.group(1).replace(r"\/", "/").replace("&amp;", "&")
-            if not any(bad in img.lower() for bad in ['pixel', 'blank', 'transparent', '.webm', '.mp4']):
-                return img
-        return ""
-
-    @staticmethod
-    def extract_duration(block: str) -> str:
-        match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.I)
-        if match:
-            val = match.group(1) or match.group(2)
-            return val.strip() if val else "HD"
-        return "HD"
-
-    @staticmethod
-    def is_ad(title: str) -> bool:
-        return bool(re.search(r'\b(sponsor(?:ed)?|promo(?:tion)?|banner|signup|premium|ads?|advert)\b', title, re.I))
-
-    @staticmethod
-    def clean_title(title: str) -> str:
-        return title.replace("&quot;", '"').replace("&amp;", "&").replace("&#039;", "'").strip()
-
 @app.get("/api/explore")
-async def explore(q: str = "brazzers", page: int = 1):
+def explore(q: str = "brazzers", page: int = 1):
     try:
-        target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
-        html = ""
-
-        try:
-            r = await http_client.get(target_url, headers=get_stealth_headers())
-            if r.status_code == 200 and "data-video-vkey" in r.text:
-                html = r.text
-            else:
-                logger.warning(f"Standard fetch failed with code {r.status_code}. Invoking mobile headers...")
-        except Exception as err:
-            logger.error(f"Search request failed: {err}")
-
-        if not html:
-            try:
-                m_headers = get_stealth_headers()
-                m_headers["User-Agent"] = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-                m_headers["Cookie"] = "accessAgeDisclaimerPH=1; platform=mobile;"
-                r_m = await http_client.get(target_url, headers=m_headers)
-                if r_m.status_code == 200:
-                    html = r_m.text
-            except Exception as e:
-                logger.error(f"Mobile fallback failed: {e}")
-
-        if not html:
+        search_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
+        resp = scraper._fetch_page(search_url, referer="https://www.pornhub.com/")
+        if not resp or resp.status_code != 200:
             return JSONResponse([])
 
+        tree = html.fromstring(resp.content)
+        items = tree.xpath('//li[contains(@class, "pcVideoListItem")]')
         videos = []
-        blocks = re.split(r'data-video-vkey=["\']|data-vkey=["\']', html, flags=re.I)
-        search_terms = [term.strip().lower() for term in q.split() if term.strip()]
+        search_words = [w.strip().lower() for w in q.split() if w.strip()]
 
-        for block in blocks[1:]:
-            try:
-                if "adblock" in block[:400].lower() or "sponsor" in block[:400].lower():
-                    continue
+        for item in items:
+            vkey = item.get("data-video-vkey")
+            if not vkey:
+                vkey_attr = item.xpath('.//@data-video-vkey')
+                if vkey_attr:
+                    vkey = vkey_attr[0]
 
-                vkey_match = re.match(r'^([a-zA-Z0-9]+)', block)
-                if not vkey_match:
-                    continue
-                vkey = vkey_match.group(1)
-
-                sub_block = block[:3500]
-                title_match = re.search(r'title=["\']([^"\']+)["\']|alt=["\']([^"\']+)["\']', sub_block, re.I)
-                title_raw = title_match.group(1) or title_match.group(2) if title_match else "Unknown Video"
-                title = MediaExtractor.clean_title(title_raw)
-
-                if MediaExtractor.is_ad(title):
-                    continue
-
-                title_lower = title.lower()
-                if search_terms and not all(term in title_lower for term in search_terms):
-                    continue
-
-                thumb = MediaExtractor.extract_thumbnail(sub_block)
-                if not thumb:
-                    continue
-
-                date_match = re.search(r'<var class="added">([^<]+)<\/var>', sub_block, re.I)
-                upload_date = date_match.group(1).strip() if date_match else ""
-
-                if not any(v['vkey'] == vkey for v in videos):
-                    videos.append({
-                        "vkey": vkey,
-                        "title": title,
-                        "thumbnail": thumb,
-                        "duration": MediaExtractor.extract_duration(sub_block),
-                        "date": upload_date,
-                        "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
-                        "provider": "pornhub"
-                    })
-
-                if len(videos) >= 44:
-                    break
-            except Exception:
+            if not vkey:
                 continue
 
-        logger.info(f"Page {page}: successfully extracted {len(videos)} matching videos.")
+            title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text()')
+            if not title_elem:
+                title_elem = item.xpath('.//img/@alt')
+            title = title_elem[0].strip() if title_elem else "Unknown Video"
+
+            # Strict Case-Insensitive Filter: Every keyword must be in the title
+            title_lower = title.lower()
+            if search_words and not all(w in title_lower for w in search_words):
+                continue
+
+            # Core Thumbnail Scanner: Extract and clean immediately
+            raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@data-src | .//img/@src')
+            clean_thumbs = scraper.clean_thumbnails(raw_thumbs, "https://www.pornhub.com/")
+            if not clean_thumbs:
+                continue
+            thumb = clean_thumbs[0]
+
+            dur_elem = item.xpath('.//var[@class="duration"]/text() | .//span[@class="duration"]/text()')
+            duration = dur_elem[0].strip() if dur_elem else "HD"
+
+            date_elem = item.xpath('.//var[@class="added"]/text()')
+            date = date_elem[0].strip() if date_elem else ""
+
+            videos.append({
+                "vkey": vkey,
+                "title": title,
+                "thumbnail": thumb,
+                "duration": duration,
+                "date": date,
+                "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
+                "provider": "pornhub"
+            })
+
+            if len(videos) >= 44:
+                break
+
         return JSONResponse(videos)
     except Exception as e:
-        logger.error(f"Explore Endpoint Failure: {e}")
+        logger.error(f"Explore error: {e}")
         return JSONResponse([])
 
 @app.get("/api/extract")
-async def extract(url: str):
-    try:
-        if not url:
-            return JSONResponse({"status": "error", "error": "URL missing"})
-
-        vkey_match = re.search(r'viewkey=([a-zA-Z0-9]+)', url, re.I)
-        if not vkey_match:
-            return JSONResponse({"status": "error", "error": "Invalid format"})
-        vkey = vkey_match.group(1)
-
-        target_url = f"https://www.pornhub.com/view_video.php?viewkey={vkey}"
-
-        try:
-            r = await http_client.get(target_url, headers=get_stealth_headers())
-            html = r.text
-        except Exception as e:
-            return JSONResponse({"status": "error", "error": f"Upstream error: {str(e)}"})
-
-        title = ""
-        poster = ""
-        media_defs = []
-
-        flashvars_data = extract_balanced_json(html, "flashvars_") or \
-                         extract_balanced_json(html, "playerObjList_") or \
-                         extract_balanced_json(html, "flashvars")
-
-        if flashvars_data and isinstance(flashvars_data, dict):
-            media_defs = flashvars_data.get("mediaDefinitions", [])
-            title = flashvars_data.get("video_title", "")
-            poster = flashvars_data.get("image_url") or flashvars_data.get("thumb_url") or ""
-
-        if not media_defs:
-            media_defs = extract_balanced_json(html, '"mediaDefinitions"') or []
-
-        if not title:
-            h1_match = re.search(r'<h1[^>]*class="[^"]*title[^"]*"[^>]*>(?:<span[^>]*class="inlineFree"[^>]*>)?([^<]+)', html, re.I)
-            if h1_match:
-                title = h1_match.group(1).strip()
-
-        if not title:
-            og_match = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-            if og_match:
-                title = og_match.group(1).replace(" - Pornhub.com", "").strip()
-
-        title = MediaExtractor.clean_title(title or "Video Player")
-
-        if not poster:
-            p_match = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-            if p_match:
-                poster = p_match.group(1)
-
-        qualities_dict = {}
-
-        for m in media_defs:
-            if not isinstance(m, dict):
-                continue
-            v_url = m.get("videoUrl") or m.get("url")
-            if not v_url:
-                continue
-
-            v_url = v_url.replace(r"\/", "/")
-            q_val = m.get("quality", "")
-            if isinstance(q_val, list) and len(q_val) > 0:
-                q_val = str(q_val[0])
-            else:
-                q_val = str(q_val)
-
-            fmt = str(m.get("format", "")).lower()
-            is_hls = fmt == "hls" or ".m3u8" in v_url
-
-            if is_hls and ("master.m3u8" in v_url or "index.m3u8" in v_url):
-                try:
-                    m3_r = await http_client.get(v_url, headers={"User-Agent": get_stealth_headers()["User-Agent"], "Referer": "https://www.pornhub.com/"})
-                    if m3_r.status_code == 200 and "#EXT-X-STREAM-INF" in m3_r.text:
-                        lines = m3_r.text.splitlines()
-                        base_url = v_url[:v_url.rfind('/')+1]
-                        for i, line in enumerate(lines):
-                            if line.startswith("#EXT-X-STREAM-INF:"):
-                                res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
-                                parsed_q = ""
-                                if res_match:
-                                    parts = res_match.group(1).split('x')
-                                    if len(parts) > 1:
-                                        parsed_q = f"{parts[1]}p"
-
-                                if parsed_q and i + 1 < len(lines):
-                                    uri = lines[i+1].strip()
-                                    if not uri.startswith("#"):
-                                        abs_uri = uri if uri.startswith("http") else urljoin(base_url, uri)
-                                        if parsed_q not in qualities_dict:
-                                            qualities_dict[parsed_q] = {"quality": parsed_q, "url": abs_uri, "type": "hls"}
-                        continue
-                except Exception:
-                    pass
-
-            if q_val.isdigit():
-                q_val = f"{q_val}p"
-
-            if not q_val or q_val.lower() in ["source", "auto", "unknown"]:
-                q_val = "Adaptive HD"
-
-            if q_val not in qualities_dict:
-                qualities_dict[q_val] = {
-                    "quality": q_val,
-                    "url": v_url,
-                    "type": "hls" if is_hls else "mp4"
-                }
-
-        if not qualities_dict:
-            clean_html = html.replace(r"\/", "/")
-            m3u8_links = re.findall(r'(https?://[^"\'\s<>]+\.m3u8[^"\'\s<>]*)', clean_html)
-            for link in m3u8_links:
-                try:
-                    m3_r = await http_client.get(link, headers={"User-Agent": get_stealth_headers()["User-Agent"], "Referer": "https://www.pornhub.com/"})
-                    if m3_r.status_code == 200 and "#EXT-X-STREAM-INF" in m3_r.text:
-                        lines = m3_r.text.splitlines()
-                        base_url = link[:link.rfind('/')+1]
-                        for i, line in enumerate(lines):
-                            if line.startswith("#EXT-X-STREAM-INF:"):
-                                res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
-                                if res_match:
-                                    parsed_q = f"{res_match.group(1).split('x')[1]}p"
-                                    if i + 1 < len(lines):
-                                        sub_uri = lines[i+1].strip()
-                                        if not sub_uri.startswith("#"):
-                                            abs_uri = sub_uri if sub_uri.startswith("http") else urljoin(base_url, sub_uri)
-                                            if parsed_q not in qualities_dict:
-                                                qualities_dict[parsed_q] = {"quality": parsed_q, "url": abs_uri, "type": "hls"}
-                except Exception:
-                    pass
-                if qualities_dict:
-                    break
-
-            if not qualities_dict and m3u8_links:
-                qualities_dict["Adaptive HD"] = {"quality": "Adaptive HD", "url": m3u8_links[0], "type": "hls"}
-
-        qualities = list(qualities_dict.values())
-
-        def get_res(q):
-            num = re.sub(r'\D', '', q['quality'])
-            return int(num) if num else 0
-
-        qualities.sort(key=get_res, reverse=True)
-
-        return JSONResponse({
-            "status": "success",
-            "title": title,
-            "thumbnail": poster.replace(r"\/", "/").replace("&amp;", "&") if poster else "",
-            "streams": {"qualities": qualities},
-            "url": target_url,
-            "provider": "pornhub"
-        })
-    except Exception as e:
-        logger.error(f"Extract API Error: {e}")
-        return JSONResponse({"status": "error", "error": f"Internal API Error: {str(e)}"})
+def extract_endpoint(url: str):
+    if not url:
+        return JSONResponse({"status": "error", "error": "Missing URL"})
+    res = scraper.extract(unquote(url))
+    return JSONResponse(res)
 
 @app.get("/proxy-image")
-async def fallback_proxy_image(url: str):
+def fallback_proxy_image(url: str):
+    target = unquote(url).strip()
+    if target.startswith('//'):
+        target = "https:" + target
     try:
-        req = http_client.build_request("GET", unquote(url), headers=get_stealth_headers())
-        r = await http_client.send(req, stream=True)
-        return StreamingResponse(
-            r.aiter_raw(),
-            status_code=r.status_code,
-            headers={
-                "Content-Type": r.headers.get("Content-Type", "image/jpeg"),
-                "Access-Control-Allow-Origin": "*"
-            }
-        )
+        req = requests.get(target, headers=scraper.headers, stream=True, timeout=15)
+        return StreamingResponse(req.iter_content(chunk_size=8192), status_code=req.status_code, headers={"Content-Type": req.headers.get("Content-Type", "image/jpeg"), "Access-Control-Allow-Origin": "*"})
     except Exception:
         return Response(status_code=404)
 
 @app.get("/")
-def read_root():
-    return {"status": "Online", "gateway": "VexoStream Scraper Core"}
+def health():
+    return {"status": "Online", "engine": "VexoStream Core Scraper"}
