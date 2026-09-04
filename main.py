@@ -177,9 +177,13 @@ async def extract(url: str):
                     if not any(q['url'] == v_url for q in qualities):
                         qualities.append({"quality": "Auto", "url": v_url})
             elif fmt == "mp4" or "mp4" in v_url:
-                label = f"{qual}p" if qual.isdigit() else qual.upper()
+                clean_qual = qual.replace("[", "").replace("]", "").strip()
+                if not clean_qual or clean_qual == "[]":
+                    clean_qual = "Auto"
+                label = f"{clean_qual}p" if clean_qual.isdigit() else clean_qual.upper()
                 direct_mp4[label] = v_url
 
+        # Fallback مکانیزم پشتیبان برای اطمینان از عدم بروز خطای خالی ماندن کیفیت‌ها
         if not qualities:
             m3u8_links = re.findall(r'https?:\/\/[^"\']+\.m3u8(?:\?[^"\']*)?', html)
             for link in m3u8_links:
@@ -189,7 +193,14 @@ async def extract(url: str):
         if not direct_mp4:
             mp4_links = re.findall(r'https?:\/\/[^"\']+\.mp4(?:\?[^"\']*)?', html)
             for link in mp4_links:
-                direct_mp4["Auto"] = link
+                if "auto" not in link.lower() and "1080" in link:
+                    direct_mp4["1080p"] = link
+                elif "720" in link:
+                    direct_mp4["720p"] = link
+                elif "480" in link:
+                    direct_mp4["480p"] = link
+                else:
+                    direct_mp4["Auto"] = link
 
         if not title or title == "Unknown Title":
             og = re.search(r'<meta\s+property=["\']og:title["\']\s+content=["\']([^"\']+)["\']', html, re.I)
