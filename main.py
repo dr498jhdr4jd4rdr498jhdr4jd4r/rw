@@ -3,7 +3,7 @@ import json
 import httpx
 import logging
 from contextlib import asynccontextmanager
-from urllib.parse import unquote, quote, urljoin
+from urllib.parse import quote, urljoin
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -11,12 +11,6 @@ from fastapi.responses import JSONResponse
 # --- CONFIGURATION & LOGGING ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-FORBIDDEN_HEADERS = {
-    "host", "connection", "content-length", "cf-ray", "cf-connecting-ip", 
-    "cf-ipcountry", "cf-visitor", "cf-worker", "cdn-loop", "x-forwarded-for", 
-    "x-forwarded-proto", "x-forwarded-host", "x-real-ip"
-}
 
 # --- GLOBAL HTTP CLIENT ---
 http_client: httpx.AsyncClient = None
@@ -56,15 +50,16 @@ def get_clean_headers():
 class MediaExtractor:
     @staticmethod
     def extract_thumbnail(block: str) -> str:
-        """Deep scan for the highest quality, non-lazy-loaded thumbnail."""
-        candidates = re.findall(r'data-(?:image|thumb_url|mediumthumb|largeimage)=["\']([^"\']+)["\']', block, re.I)
+        """Deep scan for the highest quality, non-lazy-loaded thumbnail (Fixes Page 1 Black Boxes)."""
+        # Prioritize data attributes where the real image is hidden on page 1
+        for attr in ['data-image', 'data-mediumthumb', 'data-thumb_url', 'data-largeimage']:
+            match = re.search(fr'{attr}=["\'](https?://[^"\']+\.(?:jpg|jpeg|webp|png)[^"\']*)["\']', block, re.I)
+            if match:
+                img = match.group(1).replace("\\/", "/")
+                if not any(bad in img.lower() for bad in ['blank', 'pixel', 'transparent', 'data:image']):
+                    return img
         
-        for img in candidates:
-            img = img.replace("\\/", "/")
-            if not any(bad in img.lower() for bad in ['blank', 'pixel', 'transparent', 'data:image', '.webm', '.mp4']):
-                return img if img.startswith('http') else f"https:{img}" if img.startswith('//') else img
-                
-        # Fallback to pure src if data-attributes fail (Ensuring it's a real image)
+        # Fallback to pure src if data attributes aren't used
         src_match = re.findall(r'src=["\']([^"\']+(?:\.jpg|\.webp|\.jpeg|\.png)[^"\']*)["\']', block, re.I)
         for img in src_match:
             img = img.replace("\\/", "/")
@@ -80,10 +75,6 @@ class MediaExtractor:
             val = match.group(1) or match.group(2)
             return val.strip() if val else "HD"
         return "HD"
-
-    @staticmethod
-    def clean_title(title: str) -> str:
-        return title.replace("&quot;", '"').replace("&amp;", "&").strip()
 
     @staticmethod
     def is_ad(title: str) -> bool:
@@ -109,26 +100,29 @@ async def explore_network(q: str = "brazzers", page: int = 1):
         
         for block in blocks[1:]:
             try:
-                # Early ad-block filtering
+                # 1. Early ad-block filtering
                 if "adblock" in block.lower() or "sponsor" in block.lower():
                     continue
 
+                # 2. Extract Viewkey
                 vkey_match = re.search(r'data-video-vkey=["\']([a-z0-9]+)["\']', block, re.I)
                 if not vkey_match: 
                     continue
                 vkey = vkey_match.group(1)
 
+                # 3. Extract Title
                 title_match = re.search(r'title=["\']([^"\']+)["\']', block, re.I)
-                title = MediaExtractor.clean_title(title_match.group(1)) if title_match else "Unknown Title"
+                title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip() if title_match else "Unknown Title"
                 
                 if MediaExtractor.is_ad(title):
                     continue
 
+                # 4. Strictly require a valid thumbnail image
                 thumb = MediaExtractor.extract_thumbnail(block)
-                # Strict enforcement: If no valid thumbnail is found, drop the video to prevent blank cards
                 if not thumb:
                     continue
 
+                # 5. Get Upload Date
                 date_match = re.search(r'<var class="added">([^<]+)<\/var>', block, re.I)
                 upload_date = date_match.group(1).strip() if date_match else ""
 
@@ -145,7 +139,7 @@ async def explore_network(q: str = "brazzers", page: int = 1):
                 
                 if len(videos) >= 48: 
                     break
-            except Exception as e:
+            except Exception:
                 continue 
 
         return JSONResponse(videos)
@@ -194,6 +188,9 @@ async def extract_streams(url: str):
                 try: media_defs = json.loads(md_match.group(1))
                 except: pass
 
+        # ==========================================
+        # FIX: DEDUPLICATED QUALITY EXTRACTION (Fixes "Source" issue)
+        # ==========================================
         qualities_dict = {}
 
         for m in media_defs:
@@ -211,13 +208,14 @@ async def extract_streams(url: str):
             is_hls = fmt == "hls" or ".m3u8" in v_url
             stream_type = "hls" if is_hls else "mp4"
 
-            # Parse deep HLS Master playlists to extract native resolutions instead of showing "Source"
+            # Fetch Master M3U8 and parse resolutions dynamically
             if is_hls and ("master.m3u8" in v_url or "index.m3u8" in v_url):
                 try:
                     m3_r = await http_client.get(v_url, headers=get_clean_headers())
                     if m3_r.status_code == 200:
                         lines = m3_r.text.splitlines()
                         base_url = v_url[:v_url.rfind('/')+1]
+                        
                         for i, line in enumerate(lines):
                             if line.startswith("#EXT-X-STREAM-INF:"):
                                 res_match = re.search(r'RESOLUTION=(\d+x\d+)', line)
@@ -229,15 +227,15 @@ async def extract_streams(url: str):
                                 if parsed_q and i + 1 < len(lines):
                                     uri = lines[i+1].strip()
                                     abs_uri = uri if uri.startswith("http") else urljoin(base_url, uri)
+                                    # Overwrite duplicates
                                     if parsed_q not in qualities_dict:
                                         qualities_dict[parsed_q] = {"quality": parsed_q, "url": abs_uri, "type": "hls"}
-                        continue # Skip adding the master playlist if sub-playlists were mapped
+                        continue # Master mapped successfully, skip appending generic source
                 except:
                     pass
 
-            # Fallback formatting if deep parsing failed
             if not q_val:
-                q_val = "Auto (Adaptive)" if is_hls else "Native"
+                q_val = "Auto" if is_hls else "Native"
 
             if q_val not in qualities_dict:
                 qualities_dict[q_val] = {
@@ -248,18 +246,14 @@ async def extract_streams(url: str):
 
         qualities = list(qualities_dict.values())
 
-        # Final Fallback for broken mediaDefinitions
+        # Final Fallback if mediaDefinitions completely broken
         if not qualities:
             clean_html = html.replace('\\/', '/')
             master_m3u8 = re.search(r'(https?:\/\/[^"\'\s]+(?:master|index)\.m3u8(?:[^\'"]*))', clean_html)
             if master_m3u8:
-                qualities.append({"quality": "Auto (Adaptive)", "url": master_m3u8.group(1), "type": "hls"})
-            else:
-                any_m3u8 = re.search(r'(https?:\/\/[^"\'\s]+\.m3u8(?:[^\'"]*))', clean_html)
-                if any_m3u8:
-                    qualities.append({"quality": "Auto (Adaptive)", "url": any_m3u8.group(1), "type": "hls"})
+                qualities.append({"quality": "Auto", "url": master_m3u8.group(1), "type": "hls"})
 
-        # Sorting logic: Descending numerical, putting "Auto" at the end
+        # Sort qualities descending (e.g. 1080p, 720p, 480p)
         def get_res(q):
             num = re.sub(r'\D', '', q['quality'])
             return int(num) if num else -1
@@ -284,4 +278,4 @@ async def extract_streams(url: str):
 
 @app.get("/")
 def health_check():
-    return {"status": "Enterprise Proxy API V3 Online", "health": "Stable"}
+    return {"status": "Enterprise Proxy API V4 Online", "health": "Stable"}
