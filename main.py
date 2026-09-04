@@ -54,7 +54,7 @@ def get_clean_headers(request: Request):
 async def explore(q: str = "brazzers", page: int = 1):
     try:
         target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}&o=mv"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;", "Referer": "https://www.pornhub.com/"}
 
         try:
             r = await http_client.get(target_url, headers=headers)
@@ -67,13 +67,15 @@ async def explore(q: str = "brazzers", page: int = 1):
 
         for block in blocks[1:]:
             try:
-                block = block[:2500]
+                block = block[:3000]
                 vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
                 title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
 
                 thumb_match = re.search(r'data-(?:thumb_url|mediabook|image)="([^"]+)"', block, re.I)
                 if not thumb_match:
                     thumb_match = re.search(r'src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
+                if not thumb_match:
+                    thumb_match = re.search(r'data-src="([^"]+)"', block, re.I)
 
                 dur_match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.I)
                 date_match = re.search(r'<var class="added">([^<]+)<\/var>', block, re.I)
@@ -82,10 +84,12 @@ async def explore(q: str = "brazzers", page: int = 1):
                 if vkey_match and title_match and thumb_match:
                     vkey = vkey_match.group(1)
                     title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip()
-                    thumb = thumb_match.group(1)
+                    thumb = thumb_match.group(1).strip()
 
                     if thumb.startswith('//'): 
                         thumb = 'https:' + thumb
+                    elif thumb.startswith('/'):
+                        thumb = 'https://www.pornhub.com' + thumb
 
                     if not thumb.startswith('http') or 'data:image' in thumb or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
                         continue
@@ -166,7 +170,6 @@ async def extract(url: str):
             v_url = m.get("videoUrl") or m.get("url")
             if not v_url: continue
 
-            # اگر quality مستقیماً توی خود تعریف مدیا وجود داشت
             direct_quality = m.get("quality") or m.get("height")
             if direct_quality and str(direct_quality).isdigit():
                 lbl = f"{direct_quality}p"
@@ -190,14 +193,12 @@ async def extract(url: str):
                                     parts = res_match.group(1).split('x')
                                     if len(parts) > 1: height = parts[1]
                                 
-                                # اگر رزولوشن پیدا نشد از روی بقیه پارامترها یا نام فایل حدس بزن
                                 lbl = f"{height}p" if height.isdigit() and int(height)>0 else ""
                                 
                                 if i+1 < len(lines) and not lines[i+1].startswith("#"):
                                     uri = lines[i+1].strip()
                                     abs_uri = uri if uri.startswith("http") else urljoin(base_url, uri)
                                     
-                                    # اگر ارتفاع در سطر بالا نبود، از روی نام فایل m3u8 حدس بزن
                                     if not lbl or lbl == "0p":
                                         if "1080" in abs_uri: lbl = "1080p"
                                         elif "720" in abs_uri: lbl = "720p"
@@ -210,7 +211,6 @@ async def extract(url: str):
                 except:
                     pass
 
-        # پشتیبانی از متد جایگزین استخراج کیفیت‌های مستقیم MP4 اگر HLS نبود
         for m in media_defs:
             if not isinstance(m, dict): continue
             v_url = m.get("videoUrl") or m.get("url")
@@ -219,7 +219,6 @@ async def extract(url: str):
                 if not q_lbl.endswith("p") and q_lbl.isdigit(): q_lbl += "p"
                 qualities.append({"quality": q_lbl, "url": v_url})
 
-        # مرتب‌سازی کیفیت‌ها از بیشترین به کمترین رزولوشن
         def get_res(q):
             num = re.sub(r'\D', '', q['quality'])
             return int(num) if num else 0
@@ -253,13 +252,28 @@ async def proxy_video(url: str, request: Request):
 
 @app.api_route("/proxy-image", methods=["GET"])
 async def proxy_image(url: str, request: Request):
-    req_headers = get_clean_headers(request)
-    req = http_client.build_request("GET", unquote(url), headers=req_headers)
     try:
-        r = await http_client.send(req, stream=True)
-        resp_headers = {"Access-Control-Allow-Origin": "*", "Content-Type": r.headers.get("Content-Type", "image/jpeg")}
-        return StreamingResponse(r.aiter_raw(), status_code=r.status_code, headers=resp_headers, background=r.aclose)
-    except:
+        target_img_url = unquote(url)
+        if not target_img_url.startswith('http'):
+            return Response(status_code=400)
+            
+        req_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.pornhub.com/",
+            "Origin": "https://www.pornhub.com"
+        }
+        
+        r = await http_client.get(target_img_url, headers=req_headers)
+        if r.status_code != 200:
+            return Response(status_code=404)
+
+        resp_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Content-Type": r.headers.get("Content-Type", "image/jpeg"),
+            "Cache-Control": "public, max-age=86400"
+        }
+        return StreamingResponse(r.aiter_raw(), status_code=200, headers=resp_headers, background=r.aclose)
+    except Exception:
         return Response(status_code=404)
 
 @app.api_route("/proxy-m3u8", methods=["GET"])
