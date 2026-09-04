@@ -15,10 +15,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# CORE SCRAPER ENGINE (PORNHUB, XNXX, XVIDEOS, 3MOVS)
+# PORNHUB DEDICATED SCRAPER CORE
 # ============================================================================
 
-class VideoScraper:
+class PornhubScraper:
     def __init__(self):
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -54,10 +54,7 @@ class VideoScraper:
                 pass
         return None
 
-    def title_case(self, text):
-        return re.sub(r"\b\w", lambda m: m.group(0).upper(), text.strip().lower()) if text else ""
-
-    def clean_thumbnails(self, thumbs, base_url):
+    def clean_thumbnails(self, thumbs, base_url="https://www.pornhub.com/"):
         clean = []
         seen = set()
         for t in thumbs:
@@ -107,12 +104,17 @@ class VideoScraper:
             qualities.append({"quality": "HLS Master", "url": master_m3u8_url})
         return qualities
 
-    def _scrape_pornhub(self, url):
+    def extract(self, url):
         viewkey = None
         if 'viewkey=' in url:
             viewkey = url.split('viewkey=')[1].split('&')[0]
         elif 'embed/' in url:
             viewkey = url.split('embed/')[1].split('?')[0]
+        else:
+            match = re.search(r'([a-zA-Z0-9]{13,16})', url)
+            if match:
+                viewkey = match.group(1)
+
         if not viewkey:
             return {"status": "error", "error": "Invalid viewkey identifier", "url": url}
 
@@ -127,7 +129,8 @@ class VideoScraper:
                 return {"status": "error", "error": "Failed to fetch source page", "url": url}
 
             page_text = resp.text
-            fv_match = re.search(r'var\s+flashvars_\d+\s*=\s*(\{.*?\});', page_text, re.DOTALL) or re.search(r'flashvars(?:_\d+)?\s*=\s*(\{.*?\});', page_text, re.DOTALL)
+            fv_match = re.search(r'var\s+flashvars_\d+\s*=\s*(\{.*?\});', page_text, re.DOTALL) or \
+                       re.search(r'flashvars(?:_\d+)?\s*=\s*(\{.*?\});', page_text, re.DOTALL)
             if fv_match:
                 try:
                     data = json.loads(fv_match.group(1))
@@ -199,142 +202,17 @@ class VideoScraper:
             "provider": "pornhub"
         }
 
-    def _scrape_xnxx_xvideos(self, url):
-        try:
-            resp = self._fetch_page(url)
-            if not resp or resp.status_code != 200:
-                return {"status": "error", "error": f"HTTP {resp.status_code if resp else 'No Response'}", "url": url}
-        except Exception as e:
-            return {"status": "error", "error": str(e), "url": url}
-
-        page = resp.text
-        tree = html.fromstring(resp.content)
-        title_raw = tree.xpath('//meta[@property="og:title"]/@content')
-        title = self.title_case(title_raw[0]) if title_raw else "Video Player"
-        thumb_raw = tree.xpath('//meta[@property="og:image"]/@content')
-
-        raw_thumbs = set()
-        if thumb_raw:
-            raw_thumbs.add(thumb_raw[0])
-        for m in re.finditer(r'setThumbUrl(?:169|Slide|)?\(\s*[\'"](https?://[^\'"]+)[\'"]\s*\)', page):
-            raw_thumbs.add(m.group(1))
-
-        clean_thumbs = self.clean_thumbnails(raw_thumbs, url)
-        thumbnail = clean_thumbs[0] if clean_thumbs else ""
-
-        stream_data = {"direct_mp4": {}, "qualities": []}
-        hls_match = re.search(r'(?:setVideoHLS|html5player\.setVideoHLS)\(\s*[\'"]([^\'"]+)[\'"]\s*\)', page)
-        high_match = re.search(r'(?:setVideoUrlHigh|html5player\.setVideoUrlHigh)\(\s*[\'"]([^\'"]+)[\'"]\s*\)', page)
-        low_match = re.search(r'(?:setVideoUrlLow|html5player\.setVideoUrlLow)\(\s*[\'"]([^\'"]+)[\'"]\s*\)', page)
-
-        if hls_match:
-            stream_data["qualities"] = self.parse_hls_qualities(hls_match.group(1), referer=url)
-        if high_match:
-            stream_data["direct_mp4"]["720p"] = high_match.group(1)
-        if low_match:
-            stream_data["direct_mp4"]["360p"] = low_match.group(1)
-
-        return {
-            "status": "success",
-            "title": title.strip(),
-            "thumbnail": thumbnail,
-            "thumbnails": clean_thumbs,
-            "streams": stream_data,
-            "url": url,
-            "provider": "xnxx" if "xnxx" in url else "xvideos"
-        }
-
-    def _scrape_3movs(self, url):
-        try:
-            resp = self._fetch_page(url)
-            if not resp or resp.status_code != 200:
-                return {"status": "error", "error": f"HTTP {resp.status_code if resp else 'No Response'}", "url": url}
-        except Exception as e:
-            return {"status": "error", "error": str(e), "url": url}
-
-        page = resp.text
-        tree = html.fromstring(resp.content)
-
-        title_raw = tree.xpath('//meta[@property="og:title"]/@content')
-        title = self.title_case(title_raw[0]) if title_raw else "Video Player"
-        if title == "Video Player":
-            title_tag = tree.xpath('//title/text()')
-            if title_tag:
-                title = title_tag[0].split('|')[0].split('-')[0].strip()
-
-        raw_thumbs = set()
-        for meta in tree.xpath('//meta[@property="og:image"]/@content | //meta[@name="twitter:image"]/@content'):
-            raw_thumbs.add(meta)
-        for poster in tree.xpath('//video/@poster | //div[contains(@id, "player")]//img/@src'):
-            raw_thumbs.add(poster)
-        for m in re.finditer(r'poster(?:Image)?\s*[:=]\s*["\']([^"\']+)["\']', page, re.I):
-            raw_thumbs.add(m.group(1))
-
-        clean_thumbs = self.clean_thumbnails(raw_thumbs, url)
-        thumbnail = clean_thumbs[0] if clean_thumbs else ""
-
-        stream_data = {"direct_mp4": {}, "qualities": []}
-        candidates = []
-
-        player_source_elements = tree.xpath('//div[contains(@id, "player") or contains(@class, "player")]//video//source | //video//source')
-        for s in player_source_elements:
-            src = s.get('src')
-            if src:
-                candidates.append(src)
-
-        if not candidates:
-            for m in re.finditer(r'(?:video_url|video_alt_url|src|file)\s*[:=]\s*["\']([^"\']+)["\']', page):
-                candidates.append(m.group(1))
-
-        for raw_src in set(candidates):
-            full_src = raw_src.replace('\\/', '/').strip()
-            if full_src.startswith('//'):
-                full_src = "https:" + full_src
-            elif full_src.startswith('/'):
-                full_src = urljoin(url, full_src)
-
-            if '.m3u8' in full_src:
-                for q in self.parse_hls_qualities(full_src, referer=url):
-                    stream_data["qualities"].append(q)
-            elif '.mp4' in full_src:
-                res_match = re.search(r'(\d{3,4})[pP]?', full_src)
-                label = f"{res_match.group(1)}p" if res_match else "Direct MP4"
-                stream_data["direct_mp4"][label] = full_src
-
-        return {
-            "status": "success",
-            "title": title.strip(),
-            "thumbnail": thumbnail,
-            "thumbnails": clean_thumbs,
-            "streams": stream_data,
-            "url": url,
-            "provider": "3movs"
-        }
-
-    def extract(self, url):
-        m = re.search(r"\[([a-z0-9]{6,8})\]\.[^.]+$", url, re.I) or re.match(r"^([a-z0-9]{6,8})_.+", url, re.I)
-        if m:
-            url = f"https://www.xnxx.com/video-{m.group(1)}/x"
-
-        if 'pornhub' in url:
-            return self._scrape_pornhub(url)
-        elif 'xnxx' in url or 'xvideos' in url:
-            return self._scrape_xnxx_xvideos(url)
-        elif '3movs' in url:
-            return self._scrape_3movs(url)
-        return {"status": "error", "error": "Unsupported provider"}
-
-scraper = VideoScraper()
+scraper = PornhubScraper()
 
 # ============================================================================
-# FASTAPI CORE APPLICATION
+# FASTAPI APPLICATION
 # ============================================================================
 
 @asynccontextmanager
-async def lifespan_context(app: FastAPI):
+async def lifespan(app: FastAPI):
     yield
 
-app = FastAPI(title="VexoStream Enterprise Core", lifespan=lifespan_context)
+app = FastAPI(title="Pornhub Core Scraper", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -371,12 +249,12 @@ def explore(q: str = "brazzers", page: int = 1):
                 title_elem = item.xpath('.//img/@alt')
             title = title_elem[0].strip() if title_elem else "Unknown Video"
 
-            # Strict Case-Insensitive Filter: Every keyword must be in the title
+            # Strict Case-Insensitive Filter: Every search word must be in the title
             title_lower = title.lower()
             if search_words and not all(w in title_lower for w in search_words):
                 continue
 
-            # Core Thumbnail Scanner: Extract and clean immediately
+            # Core Thumbnail Scanner: Extract and filter broken or dummy placeholders
             raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@data-src | .//img/@src')
             clean_thumbs = scraper.clean_thumbnails(raw_thumbs, "https://www.pornhub.com/")
             if not clean_thumbs:
@@ -421,10 +299,17 @@ def fallback_proxy_image(url: str):
         target = "https:" + target
     try:
         req = requests.get(target, headers=scraper.headers, stream=True, timeout=15)
-        return StreamingResponse(req.iter_content(chunk_size=8192), status_code=req.status_code, headers={"Content-Type": req.headers.get("Content-Type", "image/jpeg"), "Access-Control-Allow-Origin": "*"})
+        return StreamingResponse(
+            req.iter_content(chunk_size=8192),
+            status_code=req.status_code,
+            headers={
+                "Content-Type": req.headers.get("Content-Type", "image/jpeg"),
+                "Access-Control-Allow-Origin": "*"
+            }
+        )
     except Exception:
         return Response(status_code=404)
 
 @app.get("/")
 def health():
-    return {"status": "Online", "engine": "VexoStream Core Scraper"}
+    return {"status": "Online", "engine": "Pornhub Dedicated Core"}
