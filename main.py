@@ -55,7 +55,7 @@ async def explore(q: str = "brazzers", page: int = 1):
     try:
         target_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}&o=mv"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Cookie": "accessAgeDisclaimerPH=1; platform=pc;"}
-        
+
         try:
             r = await http_client.get(target_url, headers=headers)
             html = r.text
@@ -64,17 +64,17 @@ async def explore(q: str = "brazzers", page: int = 1):
 
         videos = []
         blocks = re.split(r'data-video-vkey="', html, flags=re.I)
-        
+
         for block in blocks[1:]:
             try:
                 block = block[:2500]
                 vkey_match = re.search(r'^([a-z0-9]+)"?', block, re.I)
                 title_match = re.search(r'(?:title|alt)="([^"]+)"', block, re.I)
-                
+
                 thumb_match = re.search(r'data-(?:thumb_url|mediabook|image)="([^"]+)"', block, re.I)
                 if not thumb_match:
                     thumb_match = re.search(r'src="([^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', block, re.I)
-                
+
                 dur_match = re.search(r'<var class="duration">([^<]+)<\/var>|<span class="duration">([^<]+)<\/span>', block, re.I)
                 date_match = re.search(r'<var class="added">([^<]+)<\/var>', block, re.I)
                 upload_date = date_match.group(1).strip() if date_match else ""
@@ -83,10 +83,10 @@ async def explore(q: str = "brazzers", page: int = 1):
                     vkey = vkey_match.group(1)
                     title = title_match.group(1).replace("&quot;", '"').replace("&amp;", "&").strip()
                     thumb = thumb_match.group(1)
-                    
+
                     if thumb.startswith('//'): 
                         thumb = 'https:' + thumb
-                    
+
                     if not thumb.startswith('http') or 'data:image' in thumb or 'pixel' in thumb or 'transparent' in thumb or 'blank' in thumb:
                         continue
 
@@ -94,9 +94,9 @@ async def explore(q: str = "brazzers", page: int = 1):
                     if dur_match:
                         raw_dur = dur_match.group(1) or dur_match.group(2)
                         if raw_dur: dur = raw_dur.strip()
-                    
+
                     is_ad = re.search(r'\b(sponsor|promo|banner|signup|premium ads)\b', title, re.I)
-                    
+
                     if not is_ad and not any(v['vkey'] == vkey for v in videos):
                         videos.append({
                             "vkey": vkey, 
@@ -110,7 +110,7 @@ async def explore(q: str = "brazzers", page: int = 1):
                 if len(videos) >= 48: break
             except Exception:
                 continue 
-        
+
         return JSONResponse(videos)
     except Exception as e:
         return JSONResponse([])
@@ -143,7 +143,7 @@ async def extract(url: str):
         title = "Unknown Title"
         poster = ""
         media_defs = []
-        
+
         fv_match = re.search(r'flashvars_\d+\s*=\s*(\{.*?\});', html, re.DOTALL) or re.search(r'flashvars\s*=\s*(\{.*?\});', html, re.DOTALL) or re.search(r'var\s+playerObjList\s*=\s*(\{.*?\});', html, re.DOTALL)
         if fv_match:
             try:
@@ -152,7 +152,7 @@ async def extract(url: str):
                 title = data.get("video_title", title)
                 poster = data.get("image_url") or data.get("thumb_url") or poster
             except: pass
-        
+
         if not media_defs:
             md_match = re.search(r'"mediaDefinitions"\s*:\s*(\[\{.*?\}\])', html, re.DOTALL)
             if md_match:
@@ -165,7 +165,7 @@ async def extract(url: str):
             if not isinstance(m, dict): continue
             v_url = m.get("videoUrl") or m.get("url")
             if not v_url: continue
-            
+
             fmt = m.get("format", "")
             if fmt == "hls" or ".m3u8" in v_url:
                 try:
@@ -190,7 +190,6 @@ async def extract(url: str):
                 except:
                     pass
 
-        # HLS Fallback (Strictly named Source if Auto would be used)
         if not qualities:
             clean_html = html.replace('\\/', '/')
             m3u8_links = set(re.findall(r'(https?:\/\/[^"\'\s]+\.m3u8(?:[^\'"]*))', clean_html))
@@ -199,7 +198,6 @@ async def extract(url: str):
                     if not any(q['url'] == link for q in qualities):
                         qualities.append({"quality": "Source", "url": link})
 
-        # Ensure qualities are sorted highest to lowest if possible
         def get_res(q):
             num = re.sub(r'\D', '', q['quality'])
             return int(num) if num else 0
@@ -225,7 +223,7 @@ async def proxy_video(url: str, request: Request):
         r = await http_client.send(req, stream=True)
     except Exception as e:
         return Response(f"502 Error: {str(e)}", status_code=502)
-    
+
     resp_headers = {"Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges"}
     for h in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Content-Encoding"]:
         if h in r.headers: resp_headers[h] = r.headers[h]
@@ -247,19 +245,19 @@ async def proxy_m3u8(url: str, request: Request):
     target = unquote(url)
     req_headers = get_clean_headers(request)
     r = await http_client.get(target, headers=req_headers)
-    
+
     if r.status_code != 200:
         return Response(status_code=r.status_code)
-        
+
     base = target[:target.rfind('/')+1]
     request_host = request.query_params.get("request_host")
     cf_host = f"https://{request_host}" if request_host else f"{request.url.scheme}://{request.headers.get('host')}"
-    
+
     rewritten = []
     for line in r.text.splitlines():
         line = line.strip()
         if not line: continue
-        
+
         if line.startswith("#EXT-X-MAP:") or line.startswith("#EXT-X-KEY:"):
             def replacer(match):
                 uri = match.group(1)
