@@ -1,41 +1,27 @@
 import os
-import re
 import asyncio
 import logging
+from urllib.parse import quote, unquote
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import quote, unquote, urljoin
-from contextlib import asynccontextmanager
 
-import httpx
-import yt_dlp
-from lxml import html
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+import httpx
+from lxml import html
+import yt_dlp
+from cachetools import TTLCache
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# Powerful ThreadPool to handle heavy concurrent extractions without blocking the main event loop
-executor = ThreadPoolExecutor(max_workers=100)
+# Cache up to 2000 extractions for 2 hours to handle high traffic spikes
+extraction_cache = TTLCache(maxsize=2000, ttl=7200)
 
-# Async client for lightweight requests (like search exploration)
-client = httpx.AsyncClient(
-    headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Cookie': 'has_accepted_cookie=1; age_verified=1; platform=pc;'
-    },
-    timeout=15.0,
-    follow_redirects=True
-)
+# Limit ThreadPool to prevent OOM/CPU starvation under 1000+ concurrent loads
+thread_pool = ThreadPoolExecutor(max_workers=50)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    await client.aclose()
-    executor.shutdown()
-
-app = FastAPI(title="VexoStream Enterprise Core Async", lifespan=lifespan)
+app = FastAPI(title="Media Extraction Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,87 +30,135 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def clean_thumbnails(thumbs, base_url="https://www.pornhub.com/"):
-    clean = []
-    seen = set()
-    for t in thumbs:
-        if not t or not isinstance(t, str): continue
-        t = t.replace('\\/', '/').replace('&amp;', '&').strip().strip('\'"')
-        if t.startswith('//'): t = "https:" + t
-        elif t.startswith('/'): t = urljoin(base_url, t)
-        
-        if t.startswith('http'):
-            t_lower = t.lower()
-            if any(bad in t_lower for bad in ['favicon', 'logo', 'icon', 'banner', 'avatar', 'blank', 'pixel']):
-                continue
-            if not any(ext in t_lower for ext in ['.jpg', '.jpeg', '.png', '.webp', 'preview', 'thumb', 'poster']):
-                continue
-            if t not in seen:
-                seen.add(t)
-                clean.append(t)
-    return clean
+def extract_with_ytdlp(url: str) -> dict:
+    """Blocking yt-dlp extraction logic to be run in a thread pool."""
+    if url in extraction_cache:
+        return extraction_cache[url]
 
-def sync_extract_video(url: str):
-    """Uses yt-dlp to bypass protections, tokens, and dynamically extract all streams."""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'skip_download': True,
-        'format': 'all', # Grab all available formats
+        'extract_flat': False,
+        'format': 'all',  # Fetch all formats to parse qualities
         'nocheckcertificate': True,
-        # Uncomment below if you need proxies to bypass region blocks
-        # 'proxy': os.getenv("HTTP_PROXY", ""),
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=False)
+
+        title = info.get('title', 'Unknown Video')
+        thumbnail = info.get('thumbnail', '')
+        
+        # Aggregate all thumbnails
+        thumbnails = [t['url'] for t in info.get('thumbnails', []) if 'url' in t]
+        if thumbnail and thumbnail not in thumbnails:
+            thumbnails.insert(0, thumbnail)
+
+        qualities = []
+        seen_qualities = set()
+
+        # Parse HLS and MP4 formats
+        for f in info.get('formats', []):
+            height = f.get('height')
+            if not height:
+                continue
+            
+            q_label = f"{height}p"
+            f_url = f.get('url', '')
+            ext = f.get('ext', '')
+            protocol = f.get('protocol', '')
+
+            # Filter for video streams
+            if ext not in ['mp4', 'm3u8'] and 'm3u8' not in protocol:
+                continue
+
+            if q_label not in seen_qualities:
+                seen_qualities.add(q_label)
+                qualities.append({
+                    "quality": q_label,
+                    "url": f_url,
+                    "type": "hls" if ('m3u8' in protocol or ext == 'm3u8') else "mp4"
+                })
+
+        # Sort qualities highest to lowest
+        qualities.sort(key=lambda x: int(x['quality'].replace('p', '')), reverse=True)
+
+        if not qualities:
+            return {"status": "error", "error": "No valid streams found", "url": url}
+
+        result = {
+            "status": "success",
+            "title": title,
+            "thumbnail": thumbnail or (thumbnails[0] if thumbnails else ""),
+            "thumbnails": thumbnails,
+            "streams": {"qualities": qualities},
+            "url": url,
+            "provider": "pornhub"
+        }
+        
+        extraction_cache[url] = result
+        return result
+
+    except yt_dlp.utils.DownloadError as e:
+        return {"status": "error", "error": f"Download error: {str(e)}", "url": url}
     except Exception as e:
-        logger.error(f"yt-dlp extraction failed for {url}: {e}")
-        return None
+        logger.error(f"yt-dlp extraction failed: {e}")
+        return {"status": "error", "error": str(e), "url": url}
+
 
 @app.get("/api/explore")
 async def explore(q: str = "brazzers", page: int = 1):
+    search_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Cookie': 'has_accepted_cookie=1; age_verified=1;'
+    }
+    
     try:
-        search_url = f"https://www.pornhub.com/video/search?search={quote(q)}&page={page}"
-        resp = await client.get(search_url)
+        # Use httpx for asynchronous, non-blocking requests
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            resp = await client.get(search_url, headers=headers)
+            
         if resp.status_code != 200:
             return JSONResponse([])
 
         tree = html.fromstring(resp.content)
         items = tree.xpath('//li[contains(@class, "pcVideoListItem")]')
         videos = []
-        search_words = [w.strip().lower() for w in q.split() if w.strip()]
 
         for item in items:
             vkey = item.get("data-video-vkey") or (item.xpath('.//@data-video-vkey') or [None])[0]
-            if not vkey or any(v["vkey"] == vkey for v in videos):
+            if not vkey:
                 continue
 
             title_elem = item.xpath('.//span[@class="title"]//a/text() | .//a[contains(@class, "title")]/text() | .//img/@alt')
             title = title_elem[0].strip() if title_elem else "Unknown Video"
-            
-            if search_words and not all(w in title.lower() for w in search_words):
-                continue
 
-            raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@data-src | .//img/@src')
-            clean_thumbs = clean_thumbnails(raw_thumbs)
-            if not clean_thumbs:
+            raw_thumbs = item.xpath('.//img/@data-thumb_url | .//img/@data-mediumthumb | .//img/@data-image | .//img/@src')
+            thumb = raw_thumbs[0] if raw_thumbs else ""
+            
+            # Skip placeholders
+            if not thumb or "data:image" in thumb or "blank" in thumb:
                 continue
 
             videos.append({
                 "vkey": vkey,
                 "title": title,
-                "thumbnail": clean_thumbs[0],
+                "thumbnail": thumb,
                 "url": f"https://www.pornhub.com/view_video.php?viewkey={vkey}",
                 "provider": "pornhub"
             })
+
             if len(videos) >= 24:
                 break
 
         return JSONResponse(videos)
+
     except Exception as e:
         logger.error(f"Explore error: {e}")
         return JSONResponse([])
+
 
 @app.get("/api/extract")
 async def extract_endpoint(url: str):
@@ -133,78 +167,36 @@ async def extract_endpoint(url: str):
     
     target_url = unquote(url)
     
-    # Run heavy extraction in threadpool so 1000 users don't crash the event loop
-    loop = asyncio.get_event_loop()
-    info = await loop.run_in_executor(executor, sync_extract_video, target_url)
-    
-    if not info:
-        return JSONResponse({"status": "error", "error": "Video not found, region locked, or extraction failed.", "url": target_url})
-
-    qualities = []
-    seen_q = set()
-    
-    for f in info.get('formats', []):
-        height = f.get('height')
-        if not height: 
-            continue
-            
-        q_label = f"{height}p"
-        proto = f.get('protocol', '')
-        ext = f.get('ext', '')
-
-        # Identify stream type
-        if proto in ['m3u8_native', 'm3u8']:
-            v_type = 'hls'
-        elif ext == 'mp4' and proto in ['http', 'https']:
-            v_type = 'mp4'
-        else:
-            continue
-
-        if q_label not in seen_q:
-            qualities.append({
-                "quality": q_label,
-                "url": f.get('url'),
-                "type": v_type
-            })
-            seen_q.add(q_label)
-
-    # Sort qualities from highest to lowest
-    qualities.sort(key=lambda x: int(x['quality'].replace('p', '')), reverse=True)
-
-    if not qualities:
-        return JSONResponse({"status": "error", "error": "No streamable qualities found.", "url": target_url})
-
-    thumb = info.get('thumbnail', '')
-    
-    res = {
-        "status": "success",
-        "title": info.get('title', 'Unknown Video'),
-        "thumbnail": thumb,
-        "thumbnails": [thumb] if thumb else [],
-        "streams": {"qualities": qualities},
-        "url": target_url,
-        "provider": "pornhub"
-    }
+    # Ensure it's a full URL if only viewkey is passed
+    if "viewkey=" not in target_url and len(target_url) in [13, 15, 16] and "." not in target_url:
+         target_url = f"https://www.pornhub.com/view_video.php?viewkey={target_url}"
+         
+    loop = asyncio.get_running_loop()
+    # Offload the blocking yt-dlp task to the ThreadPoolExecutor
+    res = await loop.run_in_executor(thread_pool, extract_with_ytdlp, target_url)
     return JSONResponse(res)
+
 
 @app.get("/proxy-image")
 async def fallback_proxy_image(url: str):
     target = unquote(url).strip()
-    if target.startswith('//'): target = "https:" + target
+    if target.startswith('//'):
+        target = "https:" + target
+        
     try:
-        req = await client.get(target)
-        return Response(
-            content=req.content,
-            status_code=req.status_code,
-            headers={
-                "Content-Type": req.headers.get("Content-Type", "image/jpeg"),
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "public, max-age=86400"
-            }
-        )
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            req = await client.get(target)
+            return StreamingResponse(
+                (chunk async for chunk in req.aiter_bytes()),
+                status_code=req.status_code,
+                headers={
+                    "Content-Type": req.headers.get("Content-Type", "image/jpeg"),
+                    "Access-Control-Allow-Origin": "*"
+                }
+            )
     except Exception:
         return Response(status_code=404)
 
 @app.get("/")
 def health():
-    return {"status": "Online", "engine": "VexoStream Dedicated Core Async"}
+    return {"status": "Online", "engine": "yt-dlp Core", "concurrency": "async-threadpool"}
